@@ -61,6 +61,14 @@ const osThreadAttr_t MainTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+/* Watch these in the debugger while tuning the clamp. Raw counts, not N*m. */
+volatile int16_t clampExampleCurrentRaw = 0;
+volatile uint16_t clampExamplePeakRaw = 0;
+volatile GM6020_ClampState clampExampleState = GM6020_CLAMP_IDLE;
+volatile bool clampExampleStarted = false;
+volatile bool clampExampleStartRejected = false;
+volatile bool clampExampleFinished = false;
+
 
 /* USER CODE END PV */
 
@@ -257,6 +265,7 @@ static void MX_CAN1_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -264,6 +273,13 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -314,12 +330,75 @@ void StartLibraryHandler(void *argument)
 void StartMainTask(void *argument)
 {
   /* USER CODE BEGIN StartMainTask */
-  const float pid[3] = {100.0f, 0.01f, 0.0f};
-  /* Infinite loop */
-  for(;;)
+  (void)argument;
+
+  const uint8_t bus = 1;
+  const uint8_t motor = 2;
+  const float closingRPM = -50.0f;
+  const float pid[3] = {40.0f, 0.01f, 0.0f};
+  const GM6020_ClampConfig config = {
+    .threshold_raw = 2000, /* Lower = more sensitive to motor load. */
+    .confirm_ms = 5,       /* Reject brief spikes; longer delays the stop. */
+    .max_run_ms = 5000,    /* Stop if contact is not detected within 5 s. */
+    .command_limit = 10000  /* Voltage command cap; lower = weaker drive. */
+  };
+
+  /* Wait at most 2 seconds for fresh CAN feedback before starting. */
+  GM6020_Feedback feedback;
+  const uint32_t waitStarted = HAL_GetTick();
+  bool ready = false;
+  while ((uint32_t)(HAL_GetTick() - waitStarted) < 2000U)
   {
+    if (get6020Feedback(bus, motor, &feedback) && feedback.online)
+    {
+      ready = true;
+      break;
+    }
     osDelay(5);
-    set6020RPM(1, 2, 60.0f, pid);
+  }
+
+  /* Start exactly once. Never rearm automatically after contact or a fault. */
+  if (ready)
+  {
+    clampExampleCurrentRaw = feedback.current_raw;
+    clampExampleStarted = start6020Clamp(bus, motor, closingRPM, pid, &config);
+    clampExampleStartRejected = !clampExampleStarted;
+    if (!clampExampleStarted)
+    {
+      (void)stop6020(bus, motor);
+      clampExampleState = GM6020_CLAMP_STOPPED;
+      clampExampleFinished = true;
+    }
+  }
+  else
+  {
+    (void)stop6020(bus, motor);
+    clampExampleState = GM6020_CLAMP_FEEDBACK_LOST;
+    clampExampleFinished = true;
+  }
+
+  for (;;)
+  {
+    if (get6020Feedback(bus, motor, &feedback) && feedback.online)
+      clampExampleCurrentRaw = feedback.current_raw;
+
+    if (clampExampleStarted)
+    {
+      GM6020_ClampStatus status;
+      if (get6020ClampStatus(bus, motor, &status))
+      {
+        clampExampleState = status.state;
+        clampExamplePeakRaw = status.peak_current_raw;
+        if (status.state != GM6020_CLAMP_RUNNING)
+          clampExampleFinished = true;
+      }
+    }
+
+    /* LibraryHandler performs the actual load check and zero-output command.
+     * CONTACT = successful contact; other terminal states indicate a fault
+     * or manual stop. Zero output does not actively hold the book.
+     * Reset the board to run this one-shot demonstration again. */
+    osDelay(5);
   }
   /* USER CODE END StartMainTask */
 }

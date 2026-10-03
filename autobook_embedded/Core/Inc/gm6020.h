@@ -29,6 +29,39 @@ bool stop6020(uint8_t bus, uint8_t id);
  * distinguishes stale feedback. Position returns UINT16_MAX when offline. */
 bool get6020Feedback(uint8_t bus, uint8_t id, GM6020_Feedback *out);
 uint16_t get6020Pos(uint8_t bus, uint8_t id);
+/* Raw signed torque-current feedback, NOT N*m. False when offline. */
+bool get6020TorqueRaw(uint8_t bus, uint8_t id, int16_t *current_raw);
+/* Supply a verified/calibrated N*m per feedback count and zero-current offset.
+ * No factory feedback scaling is assumed. Positive scale, offset in raw counts. */
+bool set6020TorqueCalibration(uint8_t bus, uint8_t id, float nm_per_raw, int16_t zero_raw);
+/* Motor electromagnetic torque estimate; false when offline/uncalibrated.
+ * Does not measure clamp force or account for gearing/friction. */
+bool get6020Torque(uint8_t bus, uint8_t id, float *torque_nm);
+typedef enum {
+    GM6020_CLAMP_IDLE, GM6020_CLAMP_RUNNING, GM6020_CLAMP_CONTACT,
+    GM6020_CLAMP_FEEDBACK_LOST, GM6020_CLAMP_TIMEOUT,
+    GM6020_CLAMP_SERVICE_LATE, GM6020_CLAMP_STOPPED
+} GM6020_ClampState;
+typedef struct {
+    uint16_t threshold_raw; /* abs(current_raw), 1..32768; determine experimentally */
+    uint32_t confirm_ms; /* 0 = first crossing; otherwise sustained crossing */
+    uint32_t max_run_ms; /* nonzero maximum closure time, must exceed confirm_ms */
+    uint16_t command_limit; /* nonzero, <= bus mode command maximum */
+} GM6020_ClampConfig;
+typedef struct {
+    GM6020_ClampState state;
+    uint16_t peak_current_raw;
+} GM6020_ClampStatus;
+/* Starts one closure, requires fresh feedback and nonzero target. Explicitly
+ * rearms any latched stop; call once per closure, NOT on every task iteration.
+ * No startup blanking: load detection starts with the next received frame.
+ * Stops drive on contact, lost feedback, late service, or timeout. */
+bool start6020Clamp(uint8_t bus, uint8_t id, float rpm, const float pid[3],
+                    const GM6020_ClampConfig *config);
+bool get6020ClampStatus(uint8_t bus, uint8_t id, GM6020_ClampStatus *out);
+/* While running, ordinary nonzero RPM changes are rejected. After a guarded
+ * stop, ordinary nonzero RPM commands remain rejected until start6020Clamp.
+ * stop6020/zero RPM may always stop; they do not clear a latched stop. */
 /* Exactly one task must call Service periodically, nominally every 1 ms.
  * Owns transmission of both grouped command frames on each registered bus. */
 void GM6020_Service(void);

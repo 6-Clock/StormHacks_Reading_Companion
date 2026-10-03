@@ -8,6 +8,13 @@ typedef struct {
     GM6020_Feedback feedback;
     bool seen, enabled, derivative_ready;
     float target, gain[3], integral, previous_error;
+    float nm_per_raw;
+    int16_t zero_raw;
+    GM6020_ClampConfig clamp_config;
+    GM6020_ClampState clamp_state;
+    uint16_t peak_current_raw;
+    bool above_threshold;
+    uint32_t clamp_started_ms, above_since_ms, last_guard_sample_ms;
 } Motor;
 typedef struct {
     CAN_HandleTypeDef *can;
@@ -72,6 +79,11 @@ bool set6020RPM(uint8_t bus, uint8_t id, float rpm, const float pid[3])
     Bus *b = &buses[bus-1];
     if (!b->can) { taskEXIT_CRITICAL(); return false; }
     Motor *m = &b->motor[id-1];
+    if (rpm != 0 && m->clamp_state != GM6020_CLAMP_IDLE) {
+        taskEXIT_CRITICAL(); return false;
+    }
+    if (rpm == 0 && m->clamp_state == GM6020_CLAMP_RUNNING)
+        m->clamp_state = GM6020_CLAMP_STOPPED;
     if (m->target != rpm || memcmp(m->gain,pid,sizeof(m->gain)) != 0) reset(m);
     m->target = rpm;
     memcpy(m->gain,pid,sizeof(m->gain));
@@ -101,6 +113,79 @@ uint16_t get6020Pos(uint8_t bus, uint8_t id)
     GM6020_Feedback f;
     return get6020Feedback(bus,id,&f) && f.online ? f.position : GM6020_INVALID_POSITION;
 }
+bool get6020TorqueRaw(uint8_t bus, uint8_t id, int16_t *out)
+{
+    GM6020_Feedback f;
+    if (!out || !get6020Feedback(bus,id,&f) || !f.online) return false;
+    *out = f.current_raw;
+    return true;
+}
+bool set6020TorqueCalibration(uint8_t bus, uint8_t id, float scale, int16_t zero)
+{
+    if (!valid(bus,id) || !isfinite(scale) || scale <= 0 || scale > 1000) return false;
+    taskENTER_CRITICAL();
+    Motor *m = &buses[bus-1].motor[id-1];
+    bool ok = buses[bus-1].can != NULL;
+    if (ok) { m->nm_per_raw = scale; m->zero_raw = zero; }
+    taskEXIT_CRITICAL();
+    return ok;
+}
+bool get6020Torque(uint8_t bus, uint8_t id, float *out)
+{
+    if (!valid(bus,id) || !out) return false;
+    taskENTER_CRITICAL();
+    Motor *m = &buses[bus-1].motor[id-1];
+    bool ok = m->nm_per_raw > 0 && m->seen &&
+        (uint32_t)(HAL_GetTick()-m->feedback.timestamp_ms) < GM6020_FEEDBACK_TIMEOUT_MS;
+    if (ok) *out = ((int32_t)m->feedback.current_raw-m->zero_raw)*m->nm_per_raw;
+    taskEXIT_CRITICAL();
+    return ok;
+}
+bool start6020Clamp(uint8_t bus, uint8_t id, float rpm, const float pid[3],
+                    const GM6020_ClampConfig *config)
+{
+    if (!valid(bus,id) || !pid || !config || !isfinite(rpm) || rpm == 0 ||
+        fabsf(rpm) > 320 || config->threshold_raw == 0 || config->threshold_raw > 32768U ||
+        config->max_run_ms == 0 || config->max_run_ms > 0x7FFFFFFFU ||
+        config->confirm_ms >= config->max_run_ms || config->command_limit == 0) return false;
+    for (unsigned i=0;i<3;++i)
+        if (!isfinite(pid[i]) || pid[i] < 0 || pid[i] > 1000000.0f) return false;
+    taskENTER_CRITICAL();
+    Bus *b = &buses[bus-1];
+    Motor *m = &b->motor[id-1];
+    uint32_t now = HAL_GetTick();
+    uint16_t limit = b->mode == GM6020_VOLTAGE ? 25000U : 16384U;
+    if (!b->can || config->command_limit > limit || !m->seen ||
+        (uint32_t)(now-m->feedback.timestamp_ms) >= GM6020_FEEDBACK_TIMEOUT_MS) {
+        taskEXIT_CRITICAL(); return false;
+    }
+    /* Do not begin against a load already above the threshold. */
+    int32_t current = m->feedback.current_raw;
+    uint16_t magnitude = (uint16_t)(current < 0 ? -current : current);
+    if (magnitude >= config->threshold_raw) { taskEXIT_CRITICAL(); return false; }
+    reset(m);
+    m->target = rpm;
+    memcpy(m->gain,pid,sizeof(m->gain));
+    m->clamp_config = *config;
+    m->clamp_started_ms = now;
+    m->last_guard_sample_ms = now;
+    m->above_threshold = false;
+    m->peak_current_raw = magnitude;
+    m->clamp_state = GM6020_CLAMP_RUNNING;
+    m->enabled = true;
+    taskEXIT_CRITICAL();
+    return true;
+}
+bool get6020ClampStatus(uint8_t bus, uint8_t id, GM6020_ClampStatus *out)
+{
+    if (!valid(bus,id) || !out) return false;
+    taskENTER_CRITICAL();
+    Motor *m = &buses[bus-1].motor[id-1];
+    bool ok = buses[bus-1].can != NULL;
+    if (ok) { out->state = m->clamp_state; out->peak_current_raw = m->peak_current_raw; }
+    taskEXIT_CRITICAL();
+    return ok;
+}
 static uint16_t u16(const uint8_t *data)
 {
     return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
@@ -122,6 +207,21 @@ void GM6020_OnRx(CAN_HandleTypeDef *can, const CAN_RxHeaderTypeDef *h, const uin
         m->feedback.temperature_c = data[6];
         m->feedback.timestamp_ms = HAL_GetTick();
         m->seen = true;
+        if (m->clamp_state == GM6020_CLAMP_RUNNING) {
+            int32_t current = m->feedback.current_raw;
+            uint16_t magnitude = (uint16_t)(current < 0 ? -current : current);
+            uint32_t now = m->feedback.timestamp_ms;
+            if (magnitude > m->peak_current_raw) m->peak_current_raw = magnitude;
+            if ((uint32_t)(now-m->last_guard_sample_ms) > 20U) m->above_threshold = false;
+            m->last_guard_sample_ms = now;
+            if (magnitude >= m->clamp_config.threshold_raw) {
+                if (!m->above_threshold) { m->above_threshold = true; m->above_since_ms = now; }
+                if ((uint32_t)(now-m->above_since_ms) >= m->clamp_config.confirm_ms) {
+                    m->clamp_state = GM6020_CLAMP_CONTACT;
+                    m->enabled = false;
+                }
+            } else m->above_threshold = false;
+        }
         return;
     }
 }
@@ -143,17 +243,28 @@ void GM6020_Service(void)
         for (unsigned mi=0;mi<7;++mi) {
             Motor *m = &b->motor[mi];
             int16_t command = 0;
+            if (m->clamp_state == GM6020_CLAMP_RUNNING) {
+                if (!m->seen || (uint32_t)(now-m->feedback.timestamp_ms) >= GM6020_FEEDBACK_TIMEOUT_MS)
+                    m->clamp_state = GM6020_CLAMP_FEEDBACK_LOST;
+                else if ((uint32_t)(now-m->clamp_started_ms) >= m->clamp_config.max_run_ms)
+                    m->clamp_state = GM6020_CLAMP_TIMEOUT;
+                else if (!timely && elapsed > 20U)
+                    m->clamp_state = GM6020_CLAMP_SERVICE_LATE;
+                if (m->clamp_state != GM6020_CLAMP_RUNNING) m->enabled = false;
+            }
+            float motor_limit = m->clamp_state == GM6020_CLAMP_RUNNING ?
+                m->clamp_config.command_limit : limit;
             if (timely && m->enabled && m->seen &&
                 (uint32_t)(now-m->feedback.timestamp_ms) < GM6020_FEEDBACK_TIMEOUT_MS) {
                 float error = m->target-m->feedback.rpm;
                 float derivative = m->derivative_ready ? (error-m->previous_error)/dt : 0;
-                float next_i = clamp(m->integral+m->gain[1]*error*dt,limit);
+                float next_i = clamp(m->integral+m->gain[1]*error*dt,motor_limit);
                 float pd = m->gain[0]*error+m->gain[2]*derivative;
                 float raw = pd+next_i;
                 /* Integrate only while unsaturated or driving back out of saturation. */
-                if ((raw <= limit && raw >= -limit) || (raw > limit && error < 0) ||
-                    (raw < -limit && error > 0)) m->integral = next_i;
-                command = (int16_t)clamp(pd+m->integral,limit);
+                if ((raw <= motor_limit && raw >= -motor_limit) || (raw > motor_limit && error < 0) ||
+                    (raw < -motor_limit && error > 0)) m->integral = next_i;
+                command = (int16_t)clamp(pd+m->integral,motor_limit);
                 m->previous_error = error;
                 m->derivative_ready = true;
             } else reset(m);

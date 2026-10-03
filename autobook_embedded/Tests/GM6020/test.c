@@ -14,6 +14,10 @@ uint32_t HAL_CAN_GetTxMailboxesFreeLevel(CAN_HandleTypeDef*c){(void)c;return fre
 HAL_StatusTypeDef HAL_CAN_AddTxMessage(CAN_HandleTypeDef*c,CAN_TxHeaderTypeDef*h,uint8_t*d,uint32_t*m){assert(count<8);tx[count].id=h->StdId;tx[count].bus=c->Instance;memcpy(tx[count++].data,d,8);*m=0;return HAL_OK;}
 static void rx(CAN_HandleTypeDef*c,unsigned id,int rpm){CAN_RxHeaderTypeDef h={0};h.StdId=0x204+id;h.DLC=8;uint16_t r=(uint16_t)rpm;uint8_t d[8]={0x1f,0xff,(uint8_t)(r>>8),(uint8_t)r,0xff,0xfe,42,0};GM6020_OnRx(c,&h,d);}
 static void step(unsigned t){now=t;count=0;GM6020_Service();}
+static void load(CAN_HandleTypeDef *c,unsigned id,int current){
+CAN_RxHeaderTypeDef h={0};h.StdId=0x204+id;h.DLC=8;
+uint16_t bits=(uint16_t)current;uint8_t d[8]={0,0,0,0,(uint8_t)(bits>>8),(uint8_t)bits,30,0};GM6020_OnRx(c,&h,d);
+}
 int main(void){CAN_HandleTypeDef c1={CAN1},c2={CAN2};float pid[3]={100,0,0};GM6020_Feedback f;
 assert(get6020Pos(1,1)==UINT16_MAX);assert(!set6020RPM(1,1,10,pid));
 assert(GM6020_InitBus(1,&c1,GM6020_VOLTAGE)==HAL_OK);assert(GM6020_InitBus(2,&c2,GM6020_CURRENT)==HAL_OK);
@@ -32,4 +36,42 @@ step(151);assert(tx[1].data[4]==0x9e);
 /* Integral anti-windup: 100 cycles saturated, then reduced error. */
 float pi[3]={1000,1000,0};assert(set6020RPM(1,2,100,pi));for(unsigned t=152;t<252;t++){now=t;rx(&c1,2,0);step(t);}
 now=252;rx(&c1,2,99);step(252);assert(tx[0].data[2]==3&&tx[0].data[3]==233); /* 1001, no stored windup */
+/* Torque readout must be fresh and calibrated; raw sign is preserved. */
+int16_t raw;float torque;
+assert(get6020TorqueRaw(1,2,&raw)&&raw==-2);assert(!get6020Torque(1,2,&torque));
+assert(!set6020TorqueCalibration(1,2,NAN,0));
+assert(set6020TorqueCalibration(1,2,0.001f,-2));
+assert(get6020Torque(1,2,&torque)&&torque==0);
+now=253;load(&c1,2,-102);assert(get6020Torque(1,2,&torque)&&fabsf(torque+0.1f)<0.00001f);
+GM6020_ClampConfig cfg={1000,3,50,200};GM6020_ClampStatus cs;
+load(&c1,2,0);assert(start6020Clamp(1,2,10,pid,&cfg));
+assert(!set6020RPM(1,2,60,pid));step(253);assert(tx[0].data[2]==0&&tx[0].data[3]==200);
+now=254;load(&c1,2,1200);step(254);assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_RUNNING);
+now=255;load(&c1,2,0);step(255); /* spike rejected, confirmation resets */
+for(unsigned t=256;t<=259;++t){now=t;load(&c1,2,-1200);step(t);}
+assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_CONTACT&&cs.peak_current_raw==1200);
+assert(tx[0].data[2]==0&&tx[0].data[3]==0);assert(!set6020RPM(1,2,60,pid));
+assert(stop6020(1,2));assert(!set6020RPM(1,2,60,pid));assert(!start6020Clamp(1,2,10,pid,&cfg));
+now=260;load(&c1,2,0);assert(start6020Clamp(1,2,10,pid,&cfg));
+for(unsigned t=260;t<=310;++t){now=t;load(&c1,2,0);step(t);}
+assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_TIMEOUT);
+now=311;load(&c1,2,0);cfg.max_run_ms=500;assert(start6020Clamp(1,2,10,pid,&cfg));
+for(unsigned t=311;t<=411;++t){step(t);}
+assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_FEEDBACK_LOST);
+assert(!get6020TorqueRaw(1,2,&raw)&&!get6020Torque(1,2,&torque));
+now=412;load(&c1,2,0);assert(start6020Clamp(1,2,10,pid,&cfg));step(412);step(433);
+assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_SERVICE_LATE);
+/* Full signed magnitude, including -32768; guard works on bus 2. */
+now=434;load(&c2,5,0);cfg.confirm_ms=0;cfg.threshold_raw=32768;assert(start6020Clamp(2,5,-10,pid,&cfg));
+load(&c2,5,-32768);step(434);assert(get6020ClampStatus(2,5,&cs)&&cs.state==GM6020_CLAMP_CONTACT&&cs.peak_current_raw==32768);
+assert(tx[3].data[0]==0&&tx[3].data[1]==0);
+/* No duplicate service can advance debounce; fresh frames are required. */
+now=435;load(&c1,2,0);cfg.threshold_raw=1000;cfg.confirm_ms=3;assert(start6020Clamp(1,2,10,pid,&cfg));load(&c1,2,1500);
+for(unsigned t=435;t<=440;++t){step(t);}assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_RUNNING);
+assert(stop6020(1,2));assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_STOPPED);
+/* Wraparound timestamps maintain continuous confirmation. */
+now=UINT32_MAX-2;load(&c1,2,0);assert(start6020Clamp(1,2,10,pid,&cfg));
+load(&c1,2,1500);now=UINT32_MAX;load(&c1,2,1500);now=0;load(&c1,2,1500);
+assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_CONTACT);
+puts("PASS: torque calibration, debounce, peak tracking, latching, command limit, explicit rearm, timeout, stale feedback, service gap, int16 minimum, fresh-frame debounce, tick wrap");
 puts("PASS: protocol, signed feedback, bus isolation, validation, limits, stop, timeout, mailbox pressure, delayed service, anti-windup");}

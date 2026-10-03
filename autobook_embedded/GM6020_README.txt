@@ -32,8 +32,10 @@ not that the motor has reached speed or that CAN transmission succeeded.
 Position is an absolute single-turn encoder value 0..8191 (8192 counts/turn).
 UINT16_MAX means invalid bus/ID, no feedback, or feedback at least 100 ms old.
 The feedback getter returns whether any sample has been seen and sets online
-based on freshness. Raw torque-current feedback is intentionally not converted
-because the manual does not specify its feedback-to-ampere conversion.
+based on freshness. get6020TorqueRaw exposes raw torque-current feedback. Optional get6020Torque
+requires set6020TorqueCalibration with verified N*m/count and zero offset; no
+feedback-to-ampere conversion is assumed. See GM6020_CLAMP_README.txt for
+load detection and latched stop APIs.
 Zero RPM and stop6020 command zero output at the next successful service
 transmission; neither actively brakes nor holds position.
 
