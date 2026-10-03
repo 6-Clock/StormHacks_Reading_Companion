@@ -1,0 +1,12 @@
+../Core/Src/gm6020.c:20:13:valid	5
+../Core/Src/gm6020.c:24:14:clamp	3
+../Core/Src/gm6020.c:28:13:reset	1
+../Core/Src/gm6020.c:34:19:GM6020_InitBus	14
+../Core/Src/gm6020.c:65:6:set6020RPM	13
+../Core/Src/gm6020.c:83:6:stop6020	1
+../Core/Src/gm6020.c:88:6:get6020Feedback	5
+../Core/Src/gm6020.c:99:10:get6020Pos	3
+../Core/Src/gm6020.c:104:17:u16	1
+../Core/Src/gm6020.c:108:16:s16	1
+../Core/Src/gm6020.c:113:6:GM6020_OnRx	12
+../Core/Src/gm6020.c:128:6:GM6020_Service	24

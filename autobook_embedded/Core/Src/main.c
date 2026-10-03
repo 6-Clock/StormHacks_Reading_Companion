@@ -22,6 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "gm6020.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 /* USER CODE END Includes */
 
@@ -108,6 +111,10 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
+  if (GM6020_InitBus(1, &hcan1, GM6020_VOLTAGE) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
@@ -264,6 +271,17 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
+{
+  CAN_RxHeaderTypeDef header;
+  uint8_t data[8];
+  while (HAL_CAN_GetRxFifoFillLevel(can, CAN_RX_FIFO0) != 0)
+  {
+    if (HAL_CAN_GetRxMessage(can, CAN_RX_FIFO0, &header, data) != HAL_OK) break;
+    GM6020_OnRx(can, &header, data);
+  }
+}
+
 
 /* USER CODE END 4 */
 
@@ -277,10 +295,11 @@ static void MX_GPIO_Init(void)
 void StartLibraryHandler(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
+  TickType_t wake = xTaskGetTickCount();
+  for (;;)
   {
-    osDelay(1);
+    GM6020_Service();
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(1));
   }
   /* USER CODE END 5 */
 }
@@ -295,10 +314,12 @@ void StartLibraryHandler(void *argument)
 void StartMainTask(void *argument)
 {
   /* USER CODE BEGIN StartMainTask */
+  const float pid[3] = {100.0f, 0.01f, 0.0f};
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    osDelay(5);
+    set6020RPM(1, 2, 60.0f, pid);
   }
   /* USER CODE END StartMainTask */
 }
