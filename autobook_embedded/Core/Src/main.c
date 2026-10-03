@@ -68,6 +68,7 @@ volatile GM6020_ClampState clampExampleState = GM6020_CLAMP_IDLE;
 volatile bool clampExampleStarted = false;
 volatile bool clampExampleStartRejected = false;
 volatile bool clampExampleFinished = false;
+volatile float clampExampleTargetRPM = 0.0f;
 
 
 /* USER CODE END PV */
@@ -334,12 +335,12 @@ void StartMainTask(void *argument)
 
   const uint8_t bus = 1;
   const uint8_t motor = 2;
-  const float closingRPM = -50.0f;
-  const float pid[3] = {40.0f, 0.01f, 0.0f};
+  const float closingRPM = -60.0f;
+  const float pid[3] = {45.0f, 0.01f, 0.0f};
   const GM6020_ClampConfig config = {
-    .threshold_raw = 2000, /* Lower = more sensitive to motor load. */
+    .threshold_raw = 1000, /* Lower = more sensitive to motor load. */
     .confirm_ms = 5,       /* Reject brief spikes; longer delays the stop. */
-    .max_run_ms = 5000,    /* Stop if contact is not detected within 5 s. */
+    .max_run_ms = 3000,    /* Stop if contact is not detected within 5 s. */
     .command_limit = 10000  /* Voltage command cap; lower = weaker drive. */
   };
 
@@ -357,12 +358,18 @@ void StartMainTask(void *argument)
     osDelay(5);
   }
 
-  /* Start exactly once. Never rearm automatically after contact or a fault. */
+  /* Initial run on boot; subsequent runs are triggered by PA0 presses. */
+  float nextRPM = closingRPM;
   if (ready)
   {
     clampExampleCurrentRaw = feedback.current_raw;
     clampExampleStarted = start6020Clamp(bus, motor, closingRPM, pid, &config);
     clampExampleStartRejected = !clampExampleStarted;
+    if (clampExampleStarted)
+    {
+      clampExampleTargetRPM = nextRPM;
+      nextRPM = -nextRPM;
+    }
     if (!clampExampleStarted)
     {
       (void)stop6020(bus, motor);
@@ -377,8 +384,44 @@ void StartMainTask(void *argument)
     clampExampleFinished = true;
   }
 
+  /* PA0 has a pull-up: pressing a button wired to GND reads RESET.
+   * Initialize from the actual level so a held button does not trigger.
+   * Both press and release must remain stable for 30 ms. */
+  bool buttonSample = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
+  bool buttonStable = buttonSample;
+  uint32_t buttonChangedMs = HAL_GetTick();
+
   for (;;)
   {
+    const uint32_t now = HAL_GetTick();
+    const bool pressed = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
+    if (pressed != buttonSample)
+    {
+      buttonSample = pressed;
+      buttonChangedMs = now;
+    }
+    if (buttonSample != buttonStable && (uint32_t)(now - buttonChangedMs) >= 30U)
+    {
+      buttonStable = buttonSample;
+      if (buttonStable)
+      {
+        /* Exactly one rearm per press. Reverse only on a successful start.
+         * A press during a run restarts it with the opposite target. */
+        const bool started = start6020Clamp(bus, motor, nextRPM, pid, &config);
+        clampExampleStartRejected = !started;
+        if (started)
+        {
+          clampExampleStarted = true;
+          clampExampleFinished = false;
+          clampExampleState = GM6020_CLAMP_RUNNING;
+          clampExamplePeakRaw = 0;
+          clampExampleTargetRPM = nextRPM;
+          nextRPM = -nextRPM;
+        }
+        /* Rejected starts leave the existing run/stop and next direction intact. */
+      }
+    }
+
     if (get6020Feedback(bus, motor, &feedback) && feedback.online)
       clampExampleCurrentRaw = feedback.current_raw;
 
@@ -397,7 +440,8 @@ void StartMainTask(void *argument)
     /* LibraryHandler performs the actual load check and zero-output command.
      * CONTACT = successful contact; other terminal states indicate a fault
      * or manual stop. Zero output does not actively hold the book.
-     * Reset the board to run this one-shot demonstration again. */
+     * Press/release PA0 to rearm in alternating directions. A held button
+     * cannot repeatedly rearm. Rejected starts require another press. */
     osDelay(5);
   }
   /* USER CODE END StartMainTask */

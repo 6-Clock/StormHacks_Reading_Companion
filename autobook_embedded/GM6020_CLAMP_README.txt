@@ -1,21 +1,24 @@
 GM6020 BOOK CLAMP: CURRENT FEEDBACK AND CONTACT STOP
 
 Implemented in Core/Inc/gm6020.h and Core/Src/gm6020.c.
-MainTask now runs a one-shot closure on CAN1 motor 2 after fresh feedback
-arrives (up to 2 seconds waiting). It runs automatically on boot at +10 RPM
-with your existing PID {40, 0.01, 0}, raw threshold 1000, 3 ms confirmation,
-2 second closure timeout, and voltage command limit 1000. These are example
-values to tune by feel, not calibrated force limits. Change the RPM sign if
-positive rotation opens the clamp. No torque calibration is used.
-Contact and faults remain stopped; reset the board to repeat this demo.
+MainTask starts once on boot on CAN1 motor 2 at -50 RPM. Each debounced
+PA0 press rearms another run with the opposite direction: +50, -50, +50...
+Your settings are retained: PID {40, 0.01, 0}, raw-current threshold 2000,
+5 ms confirmation, 5 second timeout, voltage command limit 10000.
+PA0 is configured as an input with pull-up. Connect the button to GND:
+LOW is pressed. Press and release each require 30 ms of stable input.
+Holding the button, including through startup, does not cause repeated starts.
+A press during motion restarts the closure with opposite target RPM.
+A failed start does not advance the direction or reset the existing status.
+If load remains at or above the threshold, start is rejected: release and
+press again after the load/current settles. No automatic retry is performed.
+Contact/faults stay stopped until a new deliberate button press.
 Debugger watches: clampExampleCurrentRaw, clampExamplePeakRaw,
-clampExampleState, clampExampleStarted, clampExampleStartRejected and
-clampExampleFinished. CONTACT indicates contact; other terminal states
-indicate a fault/manual stop. StartRejected means config/load prevented start.
-The last current watch value remains displayed if feedback becomes stale.
-For repeated closures, replace the boot-triggered example with an explicit
-user/application trigger; call start6020Clamp exactly once per intentional
-closure. Repeated starts would rearm the latch/reset its deadline.
+clampExampleState, clampExampleTargetRPM, clampExampleStarted,
+clampExampleStartRejected, clampExampleFinished. Current remains at the last
+fresh value if feedback is lost. No N*m calibration is required.
+The button input and initial wait are polled by MainTask at 5 ms intervals.
+Button presses during the initial up-to-2-second feedback wait are not processed.
 The existing 1 ms LibraryHandler automatically handles the stop.
 
 READ LOAD
