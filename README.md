@@ -1,36 +1,39 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# LOOB Reading Companion
 
-## Getting Started
+LOOB is a small reading companion for asking questions about a passage by typing or speaking. It uses OpenAI for helpful answers and ElevenLabs for speech-to-text and narration.
 
-First, run the development server:
+## Project provenance
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+This repository is a new implementation created from project requirements on October 3, 2026. It replaces an earlier prototype and does not copy that prototype's application source code or assets. Credentials are not included.
+
+## Run locally
+
+Open two PowerShell windows.
+
+**API service**
+
+```powershell
+cd C:\Users\artur\Desktop\StormHacks_Reading_Companion_Rebuild\backend
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+# Add your real OPENAI_API_KEY, ELEVENLAB_API, and ELEVENLAB_VOICE_ID to .env
+uvicorn app.main:app --reload --port 8001
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+**Reading app**
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```powershell
+cd C:\Users\artur\Desktop\StormHacks_Reading_Companion_Rebuild
+Copy-Item .env.local.example .env.local
+npm run dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Open [http://localhost:3000](http://localhost:3000). When prompted, allow microphone access to ask a spoken question.
 
-## Learn More
+## Safety notes
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Keep `.env` and `.env.local` out of Git.
+- The browser only talks to the local backend; OpenAI and ElevenLabs keys are never exposed to client-side code.
+- If port 3000 or 8001 is already in use, choose another port and update `NEXT_PUBLIC_LOOB_API_URL` or `ALLOWED_ORIGIN` to match.
