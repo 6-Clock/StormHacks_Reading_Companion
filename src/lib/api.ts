@@ -25,11 +25,20 @@ export async function ask(question: string, pageText: string) {
   return response.json() as Promise<{ answer: string }>;
 }
 
+export type CapturePreview = {
+  data_url: string;
+  width: number;
+  height: number;
+  words: Array<{ text: string; x: number; y: number; width: number; height: number; confidence: number }>;
+  boxes_status: "available" | "unavailable" | "no_words";
+};
+
 export type CameraScan = {
   accepted: boolean;
   reason: string;
   text: string;
   metrics: Record<string, number | boolean>;
+  capture_preview?: CapturePreview | null;
   openai_review?: { accepted: boolean; reason: string; model: string } | null;
   openai_review_status: "not_requested" | "requested";
   openai_revision?: { accepted: boolean; reason: string; model: string } | null;

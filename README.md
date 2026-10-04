@@ -9,7 +9,7 @@ Prerequisites:
 - Node.js 20 or later
 - Python 3.11 or later
 - A USB camera for the computer-vision programs
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) only when using the legacy `--local-ocr` troubleshooting fallback
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) is optional for word-box overlays on captured pages and the legacy `--local-ocr` troubleshooting fallback
 
 ## Install all project dependencies
 
@@ -45,11 +45,25 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The frontend expects the API at `http://127.0.0.1:8001` unless `NEXT_PUBLIC_API_BASE_URL` is set.
 
+## Reader and Developer views
+
+The **Reader** view opens a notebook with an actual question-and-answer journal on the left and the story on the right. The journal starts empty and uses Architects Daughter handwriting. Record a question with the microphone beside **Voice log**, or type and send a question beneath that heading. Use **Read** or **Stop** in the story header to control narration. The story uses 16px text; words explicitly asked about are highlighted yellow, with an actual answer shown on a sticky note. **Mode: Reading** identifies this view, and the footer counts distinct words asked about. The sample suspense story remains available for sound testing. Paper and bookmark artwork and fonts are bundled locally.
+
+Click the green bookmark to switch to the **Developer** view. Question, microphone, and narration controls share their state with Reader; answer replay, immersive sound settings, and scanning controls remain in Developer. The appendix also shows the eye diagram, relative eye openness, gaze direction, blink phase/count, frame timing, OCR results, and real session events. Click the bookmark again to return to the Reader. It also works with Enter or Space when focused. Switching views preserves the page, question draft, sound preferences, and playback. On phones the notebook pages stack vertically.
+
+To see live eyes, run the tracker in another terminal (with the backend environment activated):
+
+```powershell
+python ".\backend\computer vision\eyetracking_opencv.py" --camera 0
+```
+
+Press **C** in the tracker window to calibrate. The developer view automatically picks up its measurements. Use a separate camera for book scanning when the tracker is active. If no tracker is running, the eye panel shows **Tracker offline**. The diagram estimates iris direction; it does not yet identify a word or location on the book. OCR displays the captured page photo and, when local Tesseract is available, actual word boxes positioned using normalized image coordinates. Live measurements poll every 500 ms, retry every five seconds while offline, and pause while the browser tab is hidden.
+
 ## Scan a physical page into the reading screen
 
-With the FastAPI service and Next.js app running, use **Scan page** above the story. A local **LOOB OCR calibration** window opens. Select the USB camera index (normally `1`), center the book page inside the yellow guide, then press **C** in that camera window to capture it; press **Q** or Escape to cancel. A successful scan replaces the displayed passage; paragraph playback and LOOB questions then use the scanned text.
+With the FastAPI service and Next.js app running, use **Scan** in the Developer view. Choose the USB camera index there (normally `1`). A local **LOOB OCR calibration** window opens; center the book page inside the yellow guide, then press **C** in that camera window to capture it; press **Q** or Escape to cancel. A successful scan replaces the displayed passage; narration and LOOB questions then use the scanned text. The Developer view retains the latest scan photo, result, duration, and available OCR metrics. Web scans are initiated manually; an eye-triggered page flip does not automatically scan the next page.
 
-The web scanner uses AI vision as its only text extractor. After you press **C** in the calibration window, it sends the selected, perspective-corrected image to OpenAI for transcription. It extracts any legible visible text, including handwritten notes and whiteboards; people and other scenery are ignored rather than causing a rejection. OpenCV is still used only to capture the sharpest frame and correct page perspective; Tesseract text is not used by the reading app.
+After you press **C** in the calibration window, the web scanner sends the selected, perspective-corrected image to OpenAI for transcription. AI vision remains the authoritative source of reading text, including handwritten notes and whiteboards; people and other scenery are ignored rather than causing a rejection. OpenCV captures the sharpest frame and corrects page perspective. Optional local Tesseract detects word boxes for the photo overlay; its text does not replace the AI transcript, and unavailable boxes are not simulated.
 
 If a scan is rejected, the Uvicorn terminal logs the configured model plus the AI reason and confidence. This distinguishes a page-quality rejection from an API/model configuration error.
 
@@ -59,7 +73,7 @@ Close the standalone `book_ocr.py` preview, Windows Camera, Teams, Zoom, and any
 
 ## Immersive narration
 
-Turn on **Immersive narration**, then tap a paragraph or choose **Read page**. LOOB classifies each paragraph as neutral, warm, or suspenseful, selects a matching ElevenLabs voice preset, and plays a generated ambient sound for warm or suspenseful passages. Literal story events can also trigger short sounds: a creaking door, footsteps, thunder, or a knock. These cues begin with the matching sentence and are limited to two per paragraph. The **Immersive sounds** slider controls ambience and effects together. **Stop reading** stops voice and all immersive sounds; turning immersive mode off returns to plain narration. Story questions and answers keep the regular voice.
+In the Developer view, turn on **Immersive narration**, then choose **Read page**. LOOB classifies each paragraph as neutral, warm, or suspenseful, selects a matching ElevenLabs voice preset, and plays a generated ambient sound for warm or suspenseful passages. Literal story events can also trigger short sounds: a creaking door, footsteps, thunder, or a knock. These cues begin with the matching sentence and are limited to two per paragraph. The **Immersive sounds** slider controls ambience and effects together. **Stop reading** stops voice and all immersive sounds; turning immersive mode off returns to plain narration. Story questions and answers keep the regular voice.
 
 Set `ELEVENLAB_VOICE_ID_WARM` and `ELEVENLAB_VOICE_ID_SUSPENSE` in `backend/.env` to hear distinct voices. If either is absent, that mood uses `ELEVENLAB_VOICE_ID` with different delivery settings. Mood and event planning uses the configured OpenAI model, with local literal-event rules as a fallback. Ambient and event sounds are synthesized in the browser, so they do not need another API key or audio files. Paragraphs with event cues are narrated in shorter sentence clips; the next clip is requested while the current one plays, and completed narration is cached until another page is scanned.
 

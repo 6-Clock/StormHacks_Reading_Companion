@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_DIR.parent))
 sys.path.insert(0, str(PROJECT_DIR / "vendor_vision"))
 sys.path.insert(0, str(PROJECT_DIR / "venv" / "Lib" / "site-packages"))
 
@@ -21,6 +22,8 @@ import mediapipe as mp
 import serial
 
 from read_mode_state import ReadModeController
+
+from app.services.eye_telemetry import EyeTelemetryPublisher  # noqa: E402
 
 
 DEFAULT_CAMERA_INDEX = 1
@@ -334,6 +337,9 @@ def main() -> int:
         min_detection_confidence=0.50,
         min_tracking_confidence=0.50,
     )
+    telemetry = EyeTelemetryPublisher()
+    telemetry.event("tracker", f"Eye tracker started on camera {args.camera}")
+    previous_mode = None
 
     try:
         while True:
@@ -388,6 +394,10 @@ def main() -> int:
 
             if eye_reading.calibration_finished:
                 print(f"[CALIBRATION] eye baseline left={blink_detector.left_baseline:.3f} right={blink_detector.right_baseline:.3f} ({eye_reading.sample_count} samples)")
+                telemetry.event(
+                    "calibration",
+                    f"Eye baseline calibrated from {eye_reading.sample_count} samples",
+                )
             snapshot = controller.update(
                 now,
                 eyes_visible=eyes_visible,
@@ -397,8 +407,33 @@ def main() -> int:
             if snapshot.blink_recorded:
                 blink_flash_until = now + 0.35
                 print(f"[BLINK] {snapshot.blink_count}/3 ({snapshot.last_blink_duration:.2f}s)")
+                telemetry.event(
+                    "blink",
+                    f"Blink {snapshot.blink_count}/3 recorded "
+                    f"({snapshot.last_blink_duration:.2f}s)",
+                )
             while pending_commands:
-                command_sender.send(pending_commands.pop(0))
+                command = pending_commands.pop(0)
+                command_sender.send(command)
+                destination = "Serial sent" if args.port else "Serial preview"
+                telemetry.event("command", f"{destination}: {command}")
+            if snapshot.display_mode != previous_mode:
+                telemetry.event("mode", f"Mode changed to {snapshot.display_mode}")
+                previous_mode = snapshot.display_mode
+            telemetry.publish({
+                "connected": True,
+                "camera_index": args.camera,
+                "mode": snapshot.display_mode,
+                "eyes_visible": eyes_visible,
+                "gaze": {"x": gaze_x, "y": gaze_y},
+                "openness": {"left": eye_reading.left_ratio, "right": eye_reading.right_ratio},
+                "phase": eye_reading.phase,
+                "blink_count": snapshot.blink_count,
+                "look_progress": snapshot.look_progress,
+                "capture_fps": reader.capture_fps,
+                "inference_fps": inference_fps,
+                "frame_age_ms": frame_age_ms,
+            })
             if diagnostic_writer is not None:
                 diagnostic_writer.writerow((f"{captured_at:.6f}", f"{frame_age_ms:.1f}", f"{reader.capture_fps:.1f}", f"{inference_fps:.1f}", f"{left_openness:.4f}", f"{right_openness:.4f}", f"{eye_reading.left_ratio:.3f}", f"{eye_reading.right_ratio:.3f}", eye_reading.phase, f"{face_width_px:.1f}", eyes_visible, snapshot.display_mode))
 
@@ -429,11 +464,16 @@ def main() -> int:
                 gaze_calibration.reset()
                 blink_detector.reset()
                 print("[RESET] reading mode and calibration cleared")
+                telemetry.event("reset", "Reading mode and eye calibration reset")
             if key == ord("c") and eyes_visible:
                 gaze_calibration.center_x, gaze_calibration.center_y = gaze_x, gaze_y
                 blink_detector.begin_calibration(now)
                 print(f"[CALIBRATION] center=({gaze_x:.3f}, {gaze_y:.3f}); keep eyes open for 1 second")
+                telemetry.event(
+                    "calibration", "Eye calibration started; hold eyes open for one second",
+                )
     finally:
+        telemetry.close()
         face_mesh.close()
         reader.close()
         cv2.destroyAllWindows()

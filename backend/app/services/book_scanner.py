@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from app.services.scan_preview import capture_preview
 
 ENGINE_PATH = Path(__file__).resolve().parents[2] / "computer vision" / "book_ocr.py"
 
@@ -19,7 +20,10 @@ def _capture_with_calibration_preview(engine: ModuleType, camera_index: int) -> 
     camera = engine.open_camera(camera_index)
     if not camera.isOpened():
         camera.release()
-        raise RuntimeError(f"Camera {camera_index} could not be opened. Close other camera apps and try another index.")
+        raise RuntimeError(
+            f"Camera {camera_index} could not be opened. "
+            "Close other camera apps and try another index."
+        )
 
     window_name = "LOOB OCR calibration — C: capture | Q: cancel"
     try:
@@ -50,7 +54,10 @@ def _capture_with_calibration_preview(engine: ModuleType, camera_index: int) -> 
             if key in (ord("q"), 27):
                 return None
     except engine.cv2.error as error:
-        raise RuntimeError("Could not open the OCR calibration window. Install opencv-python, not opencv-python-headless.") from error
+        raise RuntimeError(
+            "Could not open the OCR calibration window. "
+            "Install opencv-python, not opencv-python-headless."
+        ) from error
     finally:
         camera.release()
         try:
@@ -93,12 +100,16 @@ def scan_camera(
                 "openai_review_status": "not_requested",
                 "openai_revision": None,
                 "openai_revision_status": "not_requested",
+                "capture_preview": None,
             }
     else:
         camera = engine.open_camera(camera_index)
         if not camera.isOpened():
             camera.release()
-            raise RuntimeError(f"Camera {camera_index} could not be opened. Close other camera apps and try another index.")
+            raise RuntimeError(
+                f"Camera {camera_index} could not be opened. "
+                "Close other camera apps and try another index."
+            )
         try:
             frames = engine.capture_best_frames(camera)
         finally:
@@ -114,17 +125,21 @@ def scan_camera(
             "openai_review_status": "not_requested",
             "openai_revision": None,
             "openai_revision_status": "not_requested",
+            "capture_preview": None,
         }
 
     if not openai_api_key or not openai_model:
-        raise RuntimeError("AI OCR needs OPENAI_API_KEY and OPENAI_OCR_MODEL or OPENAI_MODEL in backend/.env.")
+        raise RuntimeError(
+            "AI OCR needs OPENAI_API_KEY and OPENAI_OCR_MODEL or OPENAI_MODEL in backend/.env."
+        )
 
     _, sharpness, brightness = engine.frame_quality(frames[0])
     page, page_detected = engine.detect_and_rectify_page(frames[0])
     review = engine.transcribe_page_with_openai(page, openai_api_key, openai_model)
     print(
         "AI OCR transcription "
-        f"model={openai_model} accepted={review.accepted} reason={review.reason} confidence={review.confidence:.2f}"
+        f"model={openai_model} accepted={review.accepted} "
+        f"reason={review.reason} confidence={review.confidence:.2f}"
     )
     revision = None
     review_status = "requested"
@@ -170,4 +185,5 @@ def scan_camera(
         "openai_review_status": review_status,
         "openai_revision": asdict(revision) if revision else None,
         "openai_revision_status": revision_status,
+        "capture_preview": capture_preview(engine, page),
     }

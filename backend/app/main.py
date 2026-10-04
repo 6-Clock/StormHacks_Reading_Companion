@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.router import api_router
 from app.core.config import settings as core_settings
 from app.services.book_scanner import scan_camera
+from app.services.eye_telemetry import read_eye_snapshot
 from app.services.narration import (
     combine_cues,
     fallback_cues,
@@ -72,6 +73,13 @@ def require_elevenlabs() -> None:
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/v1/diagnostics/eyes")
+def eye_diagnostics(response: Response) -> dict[str, object]:
+    """Read derived measurements from the separately running local eye tracker."""
+    response.headers["Cache-Control"] = "no-store"
+    return read_eye_snapshot()
 
 
 @app.post("/v1/scan-camera")

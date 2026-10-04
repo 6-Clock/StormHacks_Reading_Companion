@@ -1,17 +1,33 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
-import { ask, LoobError, makeSpeech, planNarration, scanCamera, transcribe, type NarrationMood, type NarrationPlan, type StoryEffect } from "@/lib/api";
+import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import Image from "next/image";
+import { ask, LoobError, makeSpeech, planNarration, scanCamera, transcribe, type CameraScan, type NarrationMood, type NarrationPlan, type StoryEffect } from "@/lib/api";
 import { AmbientSound } from "@/lib/ambient";
+import { DeskIcon } from "@/components/DeskIcon";
+import { DeveloperPanel } from "@/components/DeveloperPanel";
+import { useEyeDiagnostics } from "@/lib/diagnostics";
+import { countAskedWords, findAskedTerm } from "@/lib/reading-journal";
+import notebook from "@/assets/blank note.png";
+import bookmark from "@/assets/bookmark_with_no_wrinkle.png";
+import stickyNote from "@/assets/postit yellow png.png";
 
 type Message = { id: number; role: "user" | "assistant" | "notice" | "error"; text: string; voice?: boolean };
+type DeskEvent = { id: string; time: number; type: string; message: string };
 
 const initialPassage = [
   "At midnight, Mara stepped into the empty house. Footsteps sounded above her, though no one was supposed to be there. A shadow slid across the stairwell, and a whisper called her name.",
   "She followed the sound to the attic. The door creaked open before she touched it. In the dark, two pale eyes stared from behind a stack of boxes, and Mara held her breath.",
   "A small black cat padded into the moonlight and brushed against her ankle. Mara let out a laugh. The warm glow of a night-light filled the attic, and the house felt safe again.",
 ];
-const prompts = ["Why was Mara afraid?", "What was in the attic?", "Read this paragraph to me."];
+
+const timestamp = () => Date.now();
+const sessionDateLabel = () => new Intl.DateTimeFormat("en", { weekday: "short", month: "short", day: "numeric" }).format(new Date());
+const serverDateLabel = () => "Your reading journal";
+function subscribeDate(onChange: () => void) {
+  const timer = setInterval(onChange, 60_000);
+  return () => clearInterval(timer);
+}
 
 function scanError(reason: string) {
   if (reason.includes("scan_cancelled")) return "Camera calibration was cancelled. The current page was kept.";
@@ -60,25 +76,32 @@ function storyParagraphs(text: string) {
 }
 
 export function ReadingDesk() {
-  const [messages, setMessages] = useState<Message[]>([
-    { id: 1, role: "notice", text: "Page detected · The Whisper in the Attic" },
-    { id: 2, role: "assistant", text: "Hi, I’m LOOB. Tap a paragraph to hear it, or ask me a question about the page." },
-  ]);
+  const [tab, setTab] = useState<"reader" | "developer">("reader");
+  const [lastScan, setLastScan] = useState<{ result: CameraScan; capturedAt: number; durationMs: number } | null>(null);
+  const [events, setEvents] = useState<DeskEvent[]>([]);
+  const [askedTerms, setAskedTerms] = useState<string[]>([]);
+  const [wordNote, setWordNote] = useState<{ term: string; answer: string } | null>(null);
+  const sessionDate = useSyncExternalStore(subscribeDate, sessionDateLabel, serverDateLabel);
+  const diagnostics = useEyeDiagnostics(true);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [toolStatus, setToolStatus] = useState<{ text: string; error: boolean } | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [micPending, setMicPending] = useState(false);
   const [speaking, setSpeaking] = useState<number | null>(null);
   const [pageText, setPageText] = useState(() => initialPassage.join("\n\n"));
   const [pageTitle, setPageTitle] = useState("The Whisper in the Attic");
+  const [pageScanned, setPageScanned] = useState(false);
   const [cameraIndex, setCameraIndex] = useState(1);
   const [scanning, setScanning] = useState(false);
   const [immersive, setImmersive] = useState(false);
   const [ambientVolume, setAmbientVolume] = useState(60);
-  const [readingPage, setReadingPage] = useState(false);
   const [activeParagraph, setActiveParagraph] = useState<number | null>(null);
   const [pageMoods, setPageMoods] = useState<NarrationMood[] | null>(null);
   const recorder = useRef<MediaRecorder | null>(null);
-  const messageSequence = useRef(2);
+  const micWorking = useRef(false);
+  const messageSequence = useRef(0);
   const stream = useRef<MediaStream | null>(null);
   const audio = useRef<HTMLAudioElement | null>(null);
   const audioUrl = useRef<string | null>(null);
@@ -87,8 +110,15 @@ export function ReadingDesk() {
   const ambience = useRef<AmbientSound | null>(null);
   const planCache = useRef<{ text: string; plan: NarrationPlan } | null>(null);
   const speechCache = useRef(new Map<string, Blob>());
+  const journalEnd = useRef<HTMLDivElement | null>(null);
+  const questionInput = useRef<HTMLInputElement | null>(null);
+
+  function logEvent(type: string, message: string) {
+    setEvents((current) => [...current, { id: crypto.randomUUID(), time: Date.now() / 1000, type, message }].slice(-60));
+  }
 
   function add(message: Omit<Message, "id">) {
+    if (message.role === "notice" || message.role === "error") setToolStatus({ text: message.text, error: message.role === "error" });
     const id = ++messageSequence.current;
     setMessages((items) => [...items, { ...message, id }]);
   }
@@ -104,7 +134,6 @@ export function ReadingDesk() {
     ambience.current?.stop();
     ambience.current = null;
     setSpeaking(null);
-    setReadingPage(false);
     setActiveParagraph(null);
   }
 
@@ -156,6 +185,8 @@ export function ReadingDesk() {
   }
 
   async function play(text: string, id: number) {
+    if (scanning || recording || micWorking.current) return;
+    setToolStatus(null);
     stopAudio();
     const version = playbackVersion.current;
     const controller = new AbortController();
@@ -172,13 +203,15 @@ export function ReadingDesk() {
   }
 
   async function narratePage(startIndex: number, fullPage: boolean) {
+    if (scanning || recording || busy || micWorking.current) return;
+    setToolStatus(null);
     const paragraphs = storyParagraphs(pageText);
     if (!paragraphs.length) return;
+    logEvent("narration", `${fullPage ? "Page" : `Paragraph ${startIndex + 1}`} narration · ${immersive ? "immersive" : "regular"}`);
     stopAudio();
     const version = playbackVersion.current;
     const controller = new AbortController();
     speechRequest.current = controller;
-    setReadingPage(fullPage);
     setSpeaking(-(startIndex + 1));
     setActiveParagraph(startIndex);
     if (immersive) {
@@ -276,15 +309,20 @@ export function ReadingDesk() {
 
   async function submit(question: string, fromMic = false) {
     const cleaned = question.trim();
-    if (!cleaned || busy) return;
+    if (!cleaned || busy || scanning || (!fromMic && micWorking.current)) return;
+    setToolStatus(null);
+    logEvent("question", fromMic ? "Voice question submitted" : "Reader question submitted");
     stopAudio();
     add({ role: "user", text: cleaned, voice: fromMic });
+    const askedTerm = findAskedTerm(cleaned, pageText);
+    if (askedTerm) setAskedTerms((terms) => [...terms, askedTerm]);
     setInput("");
     setBusy(true);
     try {
       const result = await ask(cleaned, pageText);
       const id = ++messageSequence.current;
       setMessages((items) => [...items, { id, role: "assistant", text: result.answer }]);
+      if (askedTerm) setWordNote({ term: askedTerm, answer: result.answer });
       void play(result.answer, id);
     } catch (error) {
       add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not answer that question." });
@@ -294,11 +332,19 @@ export function ReadingDesk() {
   }
 
   async function scanPage() {
-    if (scanning) return;
+    if (scanning || busy || recording || micWorking.current) return;
+    setToolStatus(null);
     stopAudio();
     setScanning(true);
+    const startedAt = timestamp();
+    logEvent("scan", `Camera ${cameraIndex} · calibration opened`);
     try {
       const result = await scanCamera(cameraIndex);
+      const capturedAt = timestamp();
+      if (result.capture_preview || !/scan_cancelled|no_camera_frames/.test(result.reason)) {
+        setLastScan({ result, capturedAt, durationMs: capturedAt - startedAt });
+      }
+      logEvent(result.accepted ? "success" : "error", result.accepted ? `OCR accepted · ${result.text.trim().split(/\s+/).length} words` : `OCR rejected · ${result.reason}`);
       if (!result.accepted) {
         add({ role: "error", text: scanError(result.reason) });
         return;
@@ -307,12 +353,16 @@ export function ReadingDesk() {
       planCache.current = null;
       speechCache.current.clear();
       setPageMoods(null);
+      setAskedTerms([]);
+      setWordNote(null);
       setPageTitle("Scanned book page");
+      setPageScanned(true);
       const reviewNote = result.openai_revision_status === "requested"
         ? " with AI transcription and revision"
         : result.openai_review_status === "requested" ? " with AI vision review" : "";
       add({ role: "notice", text: `Page scanned${reviewNote}. You can now ask LOOB about it.` });
     } catch (error) {
+      logEvent("error", error instanceof LoobError ? error.message : "Camera scan failed");
       add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not scan the camera page." });
     } finally {
       setScanning(false);
@@ -321,7 +371,12 @@ export function ReadingDesk() {
 
   async function toggleMic() {
     if (recording) { recorder.current?.stop(); return; }
+    if (scanning || busy || micWorking.current) return;
+    setToolStatus(null);
+    stopAudio();
     if (!navigator.mediaDevices || typeof MediaRecorder === "undefined") { add({ role: "error", text: "This browser does not support microphone questions." }); return; }
+    micWorking.current = true;
+    setMicPending(true);
     try {
       const microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
       const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(MediaRecorder.isTypeSupported);
@@ -335,69 +390,133 @@ export function ReadingDesk() {
         setRecording(false);
         const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
         if (!blob.size) { add({ role: "error", text: "I did not hear anything. Please try again." }); return; }
+        micWorking.current = true;
+        setMicPending(true);
         try {
           const result = await transcribe(blob);
+          micWorking.current = false;
           await submit(result.text, true);
         } catch (error) {
           add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not transcribe that recording." });
+        } finally {
+          micWorking.current = false;
+          setMicPending(false);
         }
       };
       mediaRecorder.start();
       setRecording(true);
     } catch {
       add({ role: "error", text: "Microphone permission is off. You can still type a question." });
+    } finally {
+      micWorking.current = false;
+      setMicPending(false);
     }
   }
 
   useEffect(() => () => { stopAudio(); stream.current?.getTracks().forEach((track) => track.stop()); }, []);
+  useEffect(() => { if (tab === "reader") journalEnd.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, [messages, tab]);
   function send(event: FormEvent) { event.preventDefault(); void submit(input); }
   const paragraphs = storyParagraphs(pageText);
+  const controlsBusy = busy || micPending;
+  const wordsAsked = countAskedWords(askedTerms);
+  const journalMessages = messages.filter((message) => message.role === "user" || message.role === "assistant");
+  const latestAnswer = messages.findLast((message) => message.role === "assistant");
+  const wordCount = pageText.trim().split(/\s+/).length;
+  const liveEyes = diagnostics.status === "connected" && diagnostics.data?.connected ? diagnostics.data : null;
+  const eyeOpenness = liveEyes?.eyes_visible && liveEyes.openness
+    ? Math.round((Math.min(1, liveEyes.openness.left) + Math.min(1, liveEyes.openness.right)) * 50) : null;
+
+  function passageText(text: string) {
+    const terms = [...new Set(askedTerms.map((term) => term.replace(/\s+/g, " ")))].sort((a, b) => b.length - a.length);
+    if (!terms.length) return text;
+    const pattern = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    return text.split(new RegExp(`(?<![\\p{L}\\p{N}])(${pattern})(?![\\p{L}\\p{N}])`, "giu")).map((part, index) => index % 2 ? <mark key={index}>{part}</mark> : part);
+  }
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark">L</span><span>LOOB <small>Reading Companion</small></span></div>
-        <span className="status"><span className="dot" /> Voice ready</span>
-      </header>
-      <div className="desk">
-        <section className="card">
-          <header className="card-head"><div><p className="eyebrow">Today’s story</p><h1>{pageTitle}</h1></div><span className="page-number">Page 1</span></header>
-          <div className="scan-controls">
-            <label>Camera <input type="number" min="0" max="10" value={cameraIndex} onChange={(event) => setCameraIndex(Number(event.target.value) || 0)} disabled={scanning} /></label>
-            <span className="ai-scan-note">AI vision OCR</span>
-            <button className="scan-button" type="button" onClick={() => void scanPage()} disabled={scanning}>{scanning ? "Scanning…" : "Scan page"}</button>
-          </div>
-          <div className="narration-controls">
-            <button className="read-page-button" type="button" onClick={() => activeParagraph !== null ? stopAudio() : void narratePage(0, true)} disabled={!paragraphs.length}>
-              {activeParagraph !== null ? "Stop reading" : "Read page"}
-            </button>
-            <label className="immersive-switch"><input type="checkbox" checked={immersive} onChange={(event) => { stopAudio(); setImmersive(event.target.checked); }} /> Immersive narration</label>
-            <label className="volume-control">Immersive sounds <input type="range" min="0" max="100" value={ambientVolume} disabled={!immersive} onChange={(event) => { const value = Number(event.target.value); setAmbientVolume(value); ambience.current?.setVolume(value / 100); }} aria-label="Immersive sounds volume" /></label>
-          </div>
-          <article className="reader">{paragraphs.map((paragraph, index) => <p key={`${index}-${paragraph}`}>
-            {immersive && pageMoods?.[index] && <span className="mood-label">{pageMoods[index] === "suspense" ? "Suspense" : pageMoods[index] === "warm" ? "Warm" : "Neutral"}</span>}
-            <button className={`sentence ${activeParagraph === index ? "active" : ""}`} aria-pressed={activeParagraph === index} onClick={() => activeParagraph === index && !readingPage ? stopAudio() : void narratePage(index, false)}>{paragraph}</button>
-          </p>)}</article>
-          <footer className="reader-help">Scan opens a calibration preview: align the page, press C to capture, or Q to cancel. Only accepted text replaces this page.</footer>
-        </section>
-        <section className="card chat">
-          <header className="card-head"><div><p className="eyebrow">Ask about the page</p><h2>LOOB Companion</h2></div><span className="status">{speaking !== null ? "Speaking" : "Listening"}</span></header>
-          <div className="messages" aria-live="polite">
-            {messages.map((message) => <div key={message.id} className={`bubble ${message.role}`}>
-              {message.voice && <span className="voice-label">You said</span>}
-              {message.text}
-              {message.role === "assistant" && <button className="replay" onClick={() => speaking === message.id ? stopAudio() : void play(message.text, message.id)}>{speaking === message.id ? "Stop" : "Replay"}</button>}
-            </div>)}
-            {busy && <div className="bubble notice">LOOB is thinking…</div>}
-          </div>
-          <div className="samples">{prompts.map((prompt) => <button key={prompt} onClick={() => prompt.startsWith("Read") ? void narratePage(0, false) : void submit(prompt)}>{prompt}</button>)}</div>
-          {speaking !== null && <div className="audio-state">{activeParagraph !== null ? `Narrating paragraph ${activeParagraph + 1}${immersive ? " · immersive mode" : ""}` : "ElevenLabs voice is playing"}</div>}
-          <form className="composer" onSubmit={send}>
-            <button className={`icon-button ${recording ? "listening" : ""}`} type="button" onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"}>{recording ? "■" : "🎙"}</button>
-            <input value={input} onChange={(event) => setInput(event.target.value)} placeholder={recording ? "Listening… tap stop when you are done" : "Ask about this page"} disabled={recording} />
-            <button className="send" aria-label="Send question" disabled={busy}>↑</button>
-          </form>
-        </section>
+    <main className="reading-workspace">
+      <header className="desk-meta"><span className="wordmark">LOOB</span></header>
+      <div className="notebook">
+        <div className="notebook-art" aria-hidden="true"><Image src={notebook} alt="" fill sizes="(max-width: 760px) 1600px, 1400px" placeholder="blur" preload /></div>
+        <button
+          id="view-bookmark"
+          className="paper-bookmark"
+          type="button"
+          aria-label={tab === "reader" ? "Open Developer view" : "Return to Reader view"}
+          aria-controls={tab === "reader" ? "developer-panel" : "reader-panel"}
+          title={tab === "reader" ? "Open Developer view" : "Return to Reader view"}
+          onClick={() => setTab((current) => current === "reader" ? "developer" : "reader")}
+        >
+          <Image src={bookmark} alt="" sizes="208px" draggable={false} />
+          <span className="bookmark-label" aria-hidden="true">{tab === "reader" ? "Developer" : "Reader"} ↗</span>
+        </button>
+
+        <div id="reader-panel" className="notebook-spread" role="region" aria-label="Reader" hidden={tab !== "reader"}>
+          <section className="notebook-page left-page journal-page" aria-label="Reading journal">
+            <header className="page-heading"><span className="folio-heading">01</span><div><h1>{pageTitle}</h1><p className="page-subtitle">{sessionDate} · reading log</p></div></header>
+            <div className="reader-mode"><span>Mode: <strong>{liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
+            <div className="journal-toolbar">
+              <h2 className="journal-heading">Voice log</h2>
+              <button className={`icon-button reader-mic${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"} aria-pressed={recording} title={recording ? "Stop recording" : "Ask with your voice"}><DeskIcon name={recording ? "stop" : "mic"} width="19" height="19" /></button>
+              {recording && <span className="listening-note" role="status">listening…</span>}
+            </div>
+            <form className="reader-composer" onSubmit={send}>
+              <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask about this page…" aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />
+              <button className="icon-button" type="submit" aria-label="Send question" disabled={controlsBusy || recording || scanning || !input.trim()}><DeskIcon name="send" width="22" height="22" /></button>
+            </form>
+            {controlsBusy && <p className="reader-status" role="status">{micPending ? "Preparing your voice question…" : "Answering…"}</p>}
+            {toolStatus && <p className={`reader-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
+            <div className="journal-lines">
+              <div className="journal-messages" role="log" aria-label="Questions and answers" aria-live="polite" tabIndex={0}>
+                {journalMessages.map((message) => <div key={message.id} className={`journal-entry ${message.role}`}>
+                  <span>{message.role === "user" ? `“${message.text}”` : `(${message.text})`}</span>
+                </div>)}
+                <div ref={journalEnd} />
+              </div>
+            </div>
+            <footer className="page-footer"><span>01 <span className="footer-title">{pageTitle}</span></span><span>Voice log</span></footer>
+          </section>
+
+          <section className="notebook-page right-page story-page" aria-label="Story">
+            <header className="story-heading">
+              <span className="page-kicker">{pageScanned ? "Scanned page" : "01 · Story"}</span>
+              <div className="story-heading-actions"><span className="word-count">{wordCount} words</span><button className="notebook-button reader-read" type="button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy} aria-label={speaking !== null ? "Stop audio" : "Read story"}><DeskIcon name={speaking !== null ? "stop" : "play"} width="14" height="14" />{speaking !== null ? "Stop" : "Read"}</button></div>
+            </header>
+            <article className="story-text" aria-label="Story text" tabIndex={0}>
+              {paragraphs.map((paragraph, index) => <p key={`${index}-${paragraph}`} className={`story-paragraph${activeParagraph === index ? " active" : ""}`}>{passageText(paragraph)}</p>)}
+              {wordNote && <aside className="word-note" aria-label={`Meaning of ${wordNote.term}`}>
+                <Image src={stickyNote} alt="" fill sizes="250px" aria-hidden="true" />
+                <div className="word-note-content" tabIndex={0}><h2>{wordNote.term}</h2><p>{wordNote.answer}</p></div>
+              </aside>}
+            </article>
+            <footer className="page-footer"><span>{wordsAsked} {wordsAsked === 1 ? "word" : "words"} asked</span><span>02</span></footer>
+          </section>
+        </div>
+
+        <div id="developer-panel" className="notebook-spread" role="region" aria-label="Developer" hidden={tab !== "developer"}>
+          <DeveloperPanel diagnostics={diagnostics} lastScan={lastScan} scanning={scanning} scanDisabled={controlsBusy || recording} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} pageText={pageText} events={events}>
+            <section className="reader-tools" aria-labelledby="reader-tools-heading">
+              <h3 id="reader-tools-heading">Reader controls</h3>
+              <div className="narration-actions">
+                <button className="notebook-button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy}><DeskIcon name={speaking !== null ? "stop" : "play"} width="13" height="13" />{speaking !== null ? "Stop audio" : "Read page"}</button>
+                {latestAnswer && <button className="text-button" onClick={() => void play(latestAnswer.text, latestAnswer.id)} disabled={scanning || recording || controlsBusy}>Replay answer</button>}
+              </div>
+              <div className="sound-settings">
+                <label className="immersive-toggle"><input type="checkbox" checked={immersive} onChange={(event) => { stopAudio(); setImmersive(event.target.checked); }} /><span className="toggle-track" aria-hidden="true" /> Immersive narration</label>
+                <label className="sound-volume"><DeskIcon name="volume" width="14" height="14" /><span className="sr-only">Immersive sounds volume</span><input type="range" min="0" max="100" value={ambientVolume} disabled={!immersive} onChange={(event) => { const value = Number(event.target.value); setAmbientVolume(value); ambience.current?.setVolume(value / 100); }} /><output>{ambientVolume}%</output></label>
+              </div>
+              {immersive && pageMoods && <p className="narration-moods">{pageMoods.join(" · ")}</p>}
+              <form className="developer-composer" onSubmit={send}>
+                <button className={`icon-button${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"}><DeskIcon name={recording ? "stop" : "mic"} width="18" height="18" /></button>
+                <input ref={questionInput} value={input} onChange={(event) => setInput(event.target.value)} placeholder={recording ? "Recording…" : "Ask about this page"} aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />
+                <button className="icon-button" aria-label="Send question" disabled={controlsBusy || recording || scanning || !input.trim()}><DeskIcon name="send" width="19" height="19" /></button>
+              </form>
+              {scanning && <p className="tool-status" role="status">Camera window: C captures · Q cancels</p>}
+              {controlsBusy && <p className="tool-status" role="status">{micPending ? "Transcribing…" : "Answering…"}</p>}
+              {toolStatus && <p className={`tool-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
+            </section>
+          </DeveloperPanel>
+        </div>
       </div>
     </main>
   );
