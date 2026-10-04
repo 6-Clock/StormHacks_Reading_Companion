@@ -91,9 +91,7 @@ uv run --project backend --extra hardware python ".\backend\computer vision\eyet
 The example uses eye camera `1` and book camera `2`; the same camera index can
 also be reused after the tracker releases it. Omit `--ocr-camera` for eye tracking
 without automatic page capture. Press `C` to calibrate open eyes, `R` to reset,
-and `Q` or Escape to quit. A three-second steady gaze toggles READ mode; three
-deliberate blinks within two seconds request a page turn. Developer's Blink-only
-test mode bypasses the gaze requirement.
+and `Q` or Escape to quit. After calibration, three deliberate blinks within two seconds request a page turn. No gaze hold is required, including after a page turn.
 
 Add `--port COM3 --baud 115200` for the USB-to-TTL adapter. A `flip right` action
 sends `50 <request_id>\n` at 115200 8N1 and waits for matching MCU `ACK` and `DONE`

@@ -26,34 +26,21 @@ def blink(controller, started_at: float) -> None:
     update(controller, started_at + 0.1)
 
 
-def test_three_blinks_stops_read_mode_until_a_new_gaze_hold() -> None:
+def test_three_blinks_work_without_gaze_and_repeat_after_flip() -> None:
     commands: list[str] = []
     controller = read_mode_state.ReadModeController(commands.append)
-
-    update(controller, 0)
-    assert update(controller, 3.1).display_mode == "READ"
-
-    blink(controller, 3.2)
-    blink(controller, 3.5)
-    flip = update(controller, 3.9, open_eyes=False)
-    flip = update(controller, 4.0)
+    assert update(controller, 0, looking=False).display_mode == "READY"
+    for now in (0.1, 0.4, 0.7):
+        update(controller, now, open_eyes=False, looking=False)
+        flip = update(controller, now + 0.1, looking=False)
     assert flip.display_mode == "SIGNAL"
     assert flip.blink_count == 3
     assert commands == ["flip right"]
-
-    stopped = update(controller, 4.8)
-    assert stopped.display_mode == "STOP"
-    assert stopped.toggle_armed is False
-
-    blink(controller, 4.9)
-    blink(controller, 5.2)
-    blink(controller, 5.5)
-    assert commands == ["flip right"]
-
-    update(controller, 5.8, looking=False)
-    update(controller, 5.9)
-    assert update(controller, 9.0).display_mode == "READ"
-
+    assert update(controller, 0.9, looking=False).display_mode == "READY"
+    for now in (1.0, 1.3, 1.6):
+        update(controller, now, open_eyes=False, looking=False)
+        update(controller, now + 0.1, looking=False)
+    assert commands == ["flip right", "flip right"]
 
 def test_blink_only_accepts_next_three_blinks_without_a_settling_guard():
     commands = []
@@ -66,25 +53,25 @@ def test_blink_only_accepts_next_three_blinks_without_a_settling_guard():
     blink(controller, 0.9)
     blink(controller, 1.2)
     assert update(controller, 1.3).blink_count == 2
-    assert controller.mode == "STOP"
+    assert controller.mode == "READY"
     blink(controller, 1.4)
     assert commands == ["flip right", "flip right"]
 
 
-def test_setting_changes_clear_partial_gestures_and_require_new_hold_when_disabled():
+def test_legacy_setting_changes_clear_partial_gestures_without_gaze_gate():
     commands = []
     controller = read_mode_state.ReadModeController(commands.append)
     update(controller, 0)
     update(controller, 2.9)
     controller.set_blink_only(True)
-    assert update(controller, 3.1).display_mode == "STOP"
+    assert update(controller, 3.1).display_mode == "READY"
     blink(controller, 3.2)
     blink(controller, 3.5)
     controller.set_blink_only(False)
     blink(controller, 3.8)
     assert not commands
-    assert update(controller, 4.0).display_mode == "STOP"
-    assert update(controller, 7.0).display_mode == "READ"
+    assert update(controller, 4.0).display_mode == "READY"
+    assert update(controller, 7.0).display_mode == "READY"
 
 
 def test_busy_camera_and_invalid_face_clear_all_partial_blinks():
@@ -132,10 +119,10 @@ def test_flip_signal_is_one_display_frame_and_setting_change_resets_gesture():
     for now in (0, 0.3, 0.6):
         blink(controller, now)
     controller.set_blink_only(False)
-    assert update(controller, 0.8).display_mode == "STOP"
+    assert update(controller, 0.8).display_mode == "READY"
     controller.set_blink_only(True)
-    assert update(controller, 1.0).display_mode == "STOP"
-    assert update(controller, 1.5).display_mode == "STOP"
+    assert update(controller, 1.0).display_mode == "READY"
+    assert update(controller, 1.5).display_mode == "READY"
 
 
 def test_new_setting_revision_clears_partial_sequence_even_when_value_unchanged():

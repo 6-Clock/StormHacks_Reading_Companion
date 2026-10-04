@@ -14,7 +14,7 @@ export type EyeDiagnostics = {
   connected: boolean;
   updated_at: number | null;
   camera_index: number | null;
-  mode: "STOP" | "READ" | "SIGNAL" | null;
+  mode: "STOP" | "READ" | "READY" | "SIGNAL" | null;
   eyes_visible: boolean;
   gaze: { x: number; y: number } | null;
   openness: { left: number; right: number } | null;

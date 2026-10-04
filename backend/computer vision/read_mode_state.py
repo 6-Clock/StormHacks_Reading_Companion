@@ -1,4 +1,4 @@
-"""State machine for gaze-controlled reading and page-flip commands.
+"""State machine for calibrated blink page-flip commands.
 
 The camera layer supplies landmark-derived booleans. This module owns timing,
 debouncing, and the command decision so the behavior is testable without a webcam.
@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-TOGGLE_HOLD_SECONDS = 3.0
 # A 30 FPS camera can observe a quick natural blink for only one frame
 # (about 0.033 seconds). Keep this below one frame so it is not discarded.
 BLINK_MIN_SECONDS = 0.02
@@ -21,22 +20,21 @@ REQUIRED_FLIP_BLINKS = 3
 # One recovered open-eye frame is enough to confirm a short blink. The
 # three-blink requirement is the guard against an isolated bad frame.
 OPEN_STABLE_FRAMES = 1
-SAFETY_CLOSE_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
 class ReadModeSnapshot:
     display_mode: str
-    look_progress: float
+    look_progress: float  # Legacy telemetry field; always zero.
     blink_count: int
     closed_duration: float
-    toggle_armed: bool
+    toggle_armed: bool  # Legacy snapshot field; gaze toggling is disabled.
     blink_recorded: bool
     last_blink_duration: float | None
 
 
 class ReadModeController:
-    """Turn camera gaze and blinks into deliberate reading-mode actions."""
+    """Turn calibrated blinks into page-flip commands."""
 
     def __init__(self, send_command: Callable[[str], None]) -> None:
         self._send_command = send_command
@@ -44,10 +42,8 @@ class ReadModeController:
         self.reset()
 
     def reset(self) -> None:
-        """Return to a safe stopped mode and clear all partial gestures."""
-        self.mode = "STOP"
-        self._toggle_armed = True
-        self._camera_gaze_started_at: float | None = None
+        """Clear partial gestures without requiring a gaze hold."""
+        self.mode = "READY"
         self._eyes_closed_started_at: float | None = None
         self._blink_count = 0
         self._blink_sequence_started_at: float | None = None
@@ -57,7 +53,7 @@ class ReadModeController:
         self._awaiting_open = False
 
     def set_blink_only(self, enabled: bool, *, force: bool = False) -> None:
-        """Applying either setting starts a fresh gesture in the stopped mode."""
+        """Legacy setting changes clear gestures; both values allow direct blinks."""
         if self.blink_only != enabled or force:
             self.blink_only = enabled
             self.reset()
@@ -68,12 +64,6 @@ class ReadModeController:
         self._last_blink_at = None
         self._pending_blink_duration = None
         self._open_frames = 0
-
-    def _toggle_mode(self) -> None:
-        self.mode = "READ" if self.mode == "STOP" else "STOP"
-        self._toggle_armed = False
-        self._camera_gaze_started_at = None
-        self._clear_blinks()
 
     def _record_blink(self, now: float, closed_duration: float) -> bool:
         if not BLINK_MIN_SECONDS <= closed_duration <= BLINK_MAX_SECONDS:
@@ -91,9 +81,7 @@ class ReadModeController:
 
     def _emit_flip(self) -> None:
         self._send_command("flip right")
-        self.mode = "STOP"
-        self._toggle_armed = False
-        self._camera_gaze_started_at = None
+        self.mode = "READY"
         self._clear_blinks()
 
     def update(
@@ -117,14 +105,13 @@ class ReadModeController:
             # as a blink. No partial gesture survives a busy scanner, calibration,
             # or lost face, including a closure across these states.
             self._eyes_closed_started_at = None
-            self._camera_gaze_started_at = None
             self._clear_blinks()
             return ReadModeSnapshot(
                 display_mode=self.mode,
                 look_progress=0.0,
                 blink_count=self._blink_count,
                 closed_duration=0.0,
-                toggle_armed=self._toggle_armed,
+                toggle_armed=False,
                 blink_recorded=False,
                 last_blink_duration=None,
             )
@@ -142,17 +129,12 @@ class ReadModeController:
                 # A sustained closure breaks the gesture. Otherwise two old
                 # blinks plus a later blink could flip after an invalid closure.
                 self._clear_blinks()
-            if closed_duration >= SAFETY_CLOSE_SECONDS:
-                self.mode = "STOP"
-                self._toggle_armed = True
-                self._camera_gaze_started_at = None
-                self._clear_blinks()
             return ReadModeSnapshot(
                 display_mode=self.mode,
                 look_progress=0.0,
                 blink_count=self._blink_count,
                 closed_duration=closed_duration,
-                toggle_armed=self._toggle_armed,
+                toggle_armed=False,
                 blink_recorded=False,
                 last_blink_duration=None,
             )
@@ -160,9 +142,7 @@ class ReadModeController:
         closed_duration = 0.0
         if self._eyes_closed_started_at is not None:
             closed_duration = now - self._eyes_closed_started_at
-            self._pending_blink_duration = (
-                closed_duration if self.mode == "READ" or self.blink_only else None
-            )
+            self._pending_blink_duration = closed_duration
             self._eyes_closed_started_at = None
             self._open_frames = 0
         self._open_frames += 1
@@ -171,20 +151,6 @@ class ReadModeController:
             blink_recorded = self._record_blink(now, last_blink_duration)
             self._pending_blink_duration = None
 
-        if self.blink_only:
-            self._camera_gaze_started_at = None
-        elif not looking_at_camera:
-            self._toggle_armed = True
-            self._camera_gaze_started_at = None
-        elif self._toggle_armed:
-            if self._camera_gaze_started_at is None:
-                self._camera_gaze_started_at = now
-            elif now - self._camera_gaze_started_at >= TOGGLE_HOLD_SECONDS:
-                self._toggle_mode()
-
-        if self.mode != "READ" and not self.blink_only:
-            self._clear_blinks()
-
         if (
             self._blink_sequence_started_at is not None
             and now - self._blink_sequence_started_at > BLINK_WINDOW_SECONDS
@@ -192,23 +158,18 @@ class ReadModeController:
             self._clear_blinks()
 
         reported_blink_count = self._blink_count
-        flipped = (
-            (self.mode == "READ" or self.blink_only) and self._blink_count >= REQUIRED_FLIP_BLINKS
-        )
+        flipped = self._blink_count >= REQUIRED_FLIP_BLINKS
         if flipped:
             self._emit_flip()
 
-        look_progress = 0.0
-        if self._camera_gaze_started_at is not None:
-            look_progress = min(now - self._camera_gaze_started_at, TOGGLE_HOLD_SECONDS)
         return ReadModeSnapshot(
             display_mode="SIGNAL" if flipped else self.mode,
-            look_progress=look_progress,
+            look_progress=0.0,
             # Preserve the successful final count for this frame even though
             # the next reading session starts with a clean gesture.
             blink_count=reported_blink_count,
             closed_duration=closed_duration,
-            toggle_armed=self._toggle_armed,
+            toggle_armed=False,
             blink_recorded=blink_recorded,
             last_blink_duration=last_blink_duration if blink_recorded else None,
         )

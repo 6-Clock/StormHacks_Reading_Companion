@@ -379,8 +379,7 @@ def main() -> int:
                 previous_control_revision = control_state.revision
                 telemetry.event(
                     "mode",
-                    "Blink-only test mode enabled" if control_state.blink_only
-                    else "Gaze hold required; fresh reading gesture required",
+                    "Blink settings applied; fresh blink sequence required",
                 )
             camera_state = reader.state
             if control_state.should_pause:
@@ -483,7 +482,7 @@ def main() -> int:
                     and CAMERA_GAZE_Y[0] <= gaze_y <= CAMERA_GAZE_Y[1]
                     and FACE_CENTER_X[0] <= face_center <= FACE_CENTER_X[1]
                 )
-                if min(left_openness, right_openness) >= 0.08 and camera_gaze and controller.mode == "STOP":
+                if min(left_openness, right_openness) >= 0.08 and camera_gaze:
                     gaze_calibration.learn_center(gaze_x, gaze_y)
                 eye_reading = blink_detector.observe(now, left_openness, right_openness, eyes_visible=eyes_visible)
                 draw_eye(frame, landmarks, LEFT_EYE, (0, 255, 0) if camera_gaze else (0, 190, 255))
@@ -546,12 +545,11 @@ def main() -> int:
             if diagnostic_writer is not None:
                 diagnostic_writer.writerow((f"{captured_at:.6f}", f"{frame_age_ms:.1f}", f"{reader.capture_fps:.1f}", f"{inference_fps:.1f}", f"{left_openness:.4f}", f"{right_openness:.4f}", f"{eye_reading.left_ratio:.3f}", f"{eye_reading.right_ratio:.3f}", eye_reading.phase, f"{face_width_px:.1f}", eyes_visible, snapshot.display_mode))
 
-            mode_color = {"READ": (0, 220, 0), "STOP": (0, 0, 255), "SIGNAL": (255, 80, 255)}[snapshot.display_mode]
+            mode_color = {"READY": (0, 220, 0), "SIGNAL": (255, 80, 255)}[snapshot.display_mode]
             text(frame, 0, f"MODE: {snapshot.display_mode}", mode_color)
             text(frame, 1, f"Camera {args.camera}: {frame.shape[1]}x{frame.shape[0]}  capture={reader.capture_fps:.1f} FPS  age={frame_age_ms:.0f}ms")
             text(frame, 2, f"MediaPipe={inference_fps:.1f} FPS  sensitivity={args.blink_sensitivity}  face={face_width_px:.0f}px")
-            text(frame, 3, "Blink-only test: no gaze hold required" if controller.blink_only
-                 else f"Camera gaze: {camera_gaze}  hold={snapshot.look_progress:.1f}/3.0s")
+            text(frame, 3, "3 blinks within 2 seconds turn the page")
             blink_color = (0, 255, 0) if now < blink_flash_until else (255, 255, 255)
             displayed_blinks = last_blink_count if now < blink_flash_until else snapshot.blink_count
             text(frame, 4, f"Blink recorded: {displayed_blinks}/3  action=flip right", blink_color)
@@ -564,12 +562,8 @@ def main() -> int:
                 text(frame, 7, "Press C to calibrate before testing blinks", (0, 190, 255))
             elif control_state.turns_blocked:
                 text(frame, 7, "Page turns paused: camera handoff or MCU completion pending", (0, 190, 255))
-            elif controller.blink_only:
-                text(frame, 7, "Blink-only test: 3 blinks ready", (0, 220, 0))
-            elif snapshot.toggle_armed:
-                text(frame, 7, "3-second toggle: ARMED", (0, 220, 0))
             else:
-                text(frame, 7, "3-second toggle: look away briefly to RE-ARM", (0, 190, 255))
+                text(frame, 7, "Ready: 3 blinks turn the page", (0, 220, 0))
             text(frame, 8, "C=1s eye calibration  R=reset  Q/ESC=quit")
 
             cv2.imshow("OpenCV + MediaPipe Read Controller", frame)
@@ -580,8 +574,8 @@ def main() -> int:
                 controller.reset()
                 gaze_calibration.reset()
                 blink_detector.reset()
-                print("[RESET] reading mode and calibration cleared")
-                telemetry.event("reset", "Reading mode and eye calibration reset")
+                print("[RESET] blink sequence and calibration cleared")
+                telemetry.event("reset", "Blink sequence and eye calibration reset")
             if key == ord("c") and eyes_visible:
                 gaze_calibration.center_x, gaze_calibration.center_y = gaze_x, gaze_y
                 blink_detector.begin_calibration(now)

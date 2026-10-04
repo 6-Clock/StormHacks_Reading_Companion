@@ -71,13 +71,11 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
     .sort((a, b) => b.time - a.time)
     .slice(0, 20);
   const scanning = scanIsActive(scanJob);
-  const blinkOnly = tracker.applied && tracker.data?.applied_blink_only === true;
   const trackerStatus = !tracker.connected ? "Settings service offline"
     : !tracker.data?.tracker_connected ? "Tracker offline · setting waits for connection"
       : eyeStatus ? `Eye camera ${eyeStatus} · blinks paused`
         : tracker.saving || !tracker.applied ? "Applying to eye tracker…"
-        : blinkOnly ? scanning ? "Blinks paused while scanning" : "Blink-only active · stare disabled"
-          : "3-second gaze required to enter Read mode";
+        : scanning ? "Blinks paused while scanning" : "Blinks active · no gaze hold required";
   const captureStatus = !scanConnected ? "Scan service offline" : scanAction === "starting" ? "Starting scan…" : scanLabels[scanJob?.status ?? "idle"];
   const recoveryDisabled = !scanConnected || scanAction !== null || scanJob?.status === "cancelling";
   const blinkReadiness = cameraPaused ? "Eye camera released for OCR. Tracking resumes when this scan finishes."
@@ -89,8 +87,7 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
       : !data.eyes_visible ? "Move into the eye camera view so both eyes are visible."
         : data.calibrated !== true ? "Restart the eye tracker to enable live blink readiness."
           : data.turns_blocked || scanning || data.mode === "SIGNAL" ? "Page turns paused while the scanner or tracker controls are busy."
-            : !data.blink_only && data.mode !== "READ" ? "Hold your gaze for 3 seconds, or enable Blink-only test mode."
-              : "Ready — blink three times within two seconds.";
+            : "Ready — blink three times within two seconds.";
   const lastCameraGesture = data?.events.filter((event) => event.type === "blink" && /^Blink 3\/3 recorded/.test(event.message))
     .sort((a, b) => b.time - a.time)[0];
 
@@ -122,7 +119,6 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
           <div><dt>Eyes open</dt><dd>{meanOpenness === null ? "—" : `${Math.round(meanOpenness * 100)}%`}</dd></div>
           <div><dt>Blinks</dt><dd>{connected ? `${data.blink_count} / 3` : "—"}</dd></div>
           <div><dt>Gaze</dt><dd>{directionLabel(gaze)}</dd></div>
-          <div><dt>Stare timer</dt><dd>{blinkOnly ? "Off · test mode" : connected ? `${data.look_progress.toFixed(1)} / 3s` : "—"}</dd></div>
         </dl>
         <div className="camera-blink-status" role="status" aria-label="Camera blink detection">
           <p>{blinkReadiness}</p>
@@ -130,12 +126,8 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
         </div>
         <section className="developer-test-controls" aria-labelledby="developer-test-heading">
           <h3 id="developer-test-heading">Developer test</h3>
-          <label className="tracker-mode-control">
-            <input type="checkbox" role="switch" checked={tracker.data?.blink_only ?? false} disabled={tracker.saving || !tracker.connected} onChange={(event) => void tracker.toggle(event.target.checked)} aria-describedby="tracker-setting-status" />
-            <span>Blink-only test mode</span>
-          </label>
           <p id="tracker-setting-status" role="status">{trackerStatus}</p>
-          <p>When enabled, three blinks within two seconds can turn the page without entering Read mode. Page turns pause during scanning.</p>
+          <p>Three blinks within two seconds turn the page after eye calibration. Page turns pause during scanning.</p>
           {tracker.error && <p className="control-error" role="alert">{tracker.error}</p>}
           <button type="button" className="notebook-button" onClick={onTestThreeBlinks} disabled={scanDisabled || blinkTestCount !== null}>
             {blinkTestCount === null ? "Test 3 blinks" : `Blink ${blinkTestCount} / 3`}

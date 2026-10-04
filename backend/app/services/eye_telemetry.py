@@ -105,7 +105,7 @@ def sanitize_snapshot(value: Any, *, now: float | None = None) -> dict[str, Any]
     camera_index = _number(data.get("camera_index"), maximum=100)
     camera_index = int(camera_index) if camera_index is not None else None
     mode = data.get("mode")
-    mode = mode if isinstance(mode, str) and mode in {"STOP", "READ", "SIGNAL"} else None
+    mode = mode if isinstance(mode, str) and mode in {"STOP", "READ", "READY", "SIGNAL"} else None
     phase = data.get("phase")
     phase = phase if isinstance(phase, str) and phase in PHASES else None
     visible = connected and data.get("eyes_visible") is True

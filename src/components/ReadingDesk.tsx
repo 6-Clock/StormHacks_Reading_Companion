@@ -185,7 +185,7 @@ export function ReadingDesk() {
       <div id="reader-panel" className="notebook-spread" role="region" aria-label="Reader" hidden={tab !== "reader"}>
         <section className="notebook-page left-page journal-page" aria-label="Reading journal">
           <header className="page-heading"><span className="folio-heading">01</span><div><h1>{page.title}</h1><p className="page-subtitle">{sessionDate} · reading log</p></div></header>
-          <div className="reader-mode"><span>Mode: <strong>{tracker.applied && tracker.data?.applied_blink_only ? scanning ? "Blink test · scan in progress" : "Blink test · ready" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused · gaze to restart" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
+          <div className="reader-mode"><span>Mode: <strong>{scanning ? "Scan in progress" : liveEyes?.turns_blocked ? "Page turn in progress" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.calibrated && liveEyes?.eyes_visible ? "Blinks ready" : "Waiting for eye tracker"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
           <div className="journal-toolbar"><h2 className="journal-heading">Voice log</h2>{connectionButton}
             <button className="icon-button reader-mic" type="button" disabled={!connected} onClick={voice.toggleMute} aria-label={voice.microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={voice.microphoneMuted} title={voice.microphoneMuted ? "Unmute microphone" : "Mute microphone"}><DeskIcon name="mic" width="19" height="19" /></button>
           </div>

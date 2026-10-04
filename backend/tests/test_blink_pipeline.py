@@ -72,10 +72,6 @@ class BlinkPipeline:
 def test_calibrated_measurements_emit_once_only_after_third_blink(sensitivity, blink_only):
     pipeline = BlinkPipeline(sensitivity=sensitivity, blink_only=blink_only)
     pipeline.calibrate()
-    if not blink_only:
-        pipeline.frames(95, looking=True)
-        assert pipeline.controller.mode == "READ"
-
     assert pipeline.blink().blink_count == 1
     assert not pipeline.commands
     assert pipeline.blink().blink_count == 2
@@ -85,22 +81,22 @@ def test_calibrated_measurements_emit_once_only_after_third_blink(sensitivity, b
     third = next(snapshot for snapshot in pipeline.snapshots if snapshot.blink_count == 3)
     assert third.display_mode == "SIGNAL" and third.blink_recorded
 
-    # Blink-only mode admits the next gesture immediately. Gaze mode returns to STOP.
+    # Both legacy setting values admit the next gesture without gaze.
     for _ in range(3):
         pipeline.blink()
-    assert pipeline.commands == ["flip right"] * (2 if blink_only else 1)
+    assert pipeline.commands == ["flip right"] * 2
 
 
-def test_normal_mode_needs_gaze_but_blink_only_needs_no_camera_gaze():
+def test_both_legacy_setting_values_need_no_camera_gaze():
     pipeline = BlinkPipeline(blink_only=False)
     pipeline.calibrate()
     for _ in range(3):
         pipeline.blink()
-    assert not pipeline.commands
+    assert pipeline.commands == ["flip right"]
     pipeline.controller.set_blink_only(True)
     for _ in range(3):
         pipeline.blink()
-    assert pipeline.commands == ["flip right"]
+    assert pipeline.commands == ["flip right", "flip right"]
 
 
 def test_one_frame_natural_blinks_are_detected_at_30_fps():
