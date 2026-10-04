@@ -75,27 +75,29 @@ The browser refreshes the live image up to four times per second. Images stay in
 
 ### Page-turn delay and scan controls
 
-For hands-free capture, start the tracker with `--camera 1 --ocr-camera 2`. Three confirmed blinks within the two-second window obtain a 15-second page-turn reservation. The tracker fully releases the eye camera before sending `flip right`, then commits the turn to start an **eight-second wait**. Time spent reserving the turn and closing the eye camera does not count toward this delay. Developer shows **OCR starts in 8s** and counts down while the page turns. Before starting the OCR worker, the backend waits up to ten seconds for explicit eye-camera release confirmation. The worker then waits up to ten seconds to acquire the OS camera lease before opening camera `2`. Both waits report `waiting_for_eye_camera` and have a 15-second stage watchdog. After the scan worker exits and its guard ends, the eye camera reopens and requires fresh gestures.
+For hands-free capture, start the tracker with `--camera 1 --ocr-camera 2`. Three confirmed blinks within the two-second window obtain a 15-second page-turn reservation. The tracker fully releases the eye camera before sending `flip right`, waits for matching MCU `ACK` and `DONE` replies, then commits the turn to start an **eight-second wait**. Time spent reserving the turn and closing the eye camera does not count toward this delay. Developer shows **OCR starts in 8s** and counts down after the MCU sequence finishes. Before starting the OCR worker, the backend waits up to ten seconds for explicit eye-camera release confirmation. The worker then waits up to ten seconds to acquire the OS camera lease before opening camera `2`. Both waits report `waiting_for_eye_camera` and have a 15-second stage watchdog. After the scan worker exits and its guard ends, the eye camera reopens and requires fresh gestures.
 
 | Trigger | Wait before OCR | Capture behavior |
 | --- | --- | --- |
 | **Live camera** / **Scan OCR** | No page-turn delay; waits for eye-camera release if needed | Opens the live view in Developer; choose **Capture now** |
-| Real three-blink page turn | At least 8 seconds after the command is sent | Captures automatically without a calibration window |
+| Real three-blink page turn | At least 8 seconds after MCU sequence completion | Captures automatically without a calibration window |
 | **Test 3 blinks** | 8 seconds after the simulated blink sequence | Captures automatically; sends no page-flipper command |
 
 Use `--ocr-settle-seconds 10` for a longer wait; the supported range is 8–30 seconds. The server enforces the eight-second minimum for page turns and blink tests even if an older tracker requests a shorter delay. Connect the page flipper with `--port COM3` (or its actual port); without a port, UART commands are previewed in the terminal. The two camera indexes must be different.
 
 ### STM32 USB-to-TTL page-turn output
 
-After a confirmed page turn, LOOB maps its internal `flip right` action to the exact ASCII UART frame `50\n` (`0x35 0x30 0x0A`). It uses `115200` baud, 8 data bits, no parity, 1 stop bit, and no flow control by default. Run the tracker with the USB-to-TTL adapter's COM port:
+After a confirmed page turn, LOOB maps its internal `flip right` action to the ASCII UART frame `50 <request_id>\n`, using a new unsigned 32-bit request ID for each turn. It uses `115200` baud, 8 data bits, no parity, 1 stop bit, and no flow control by default. Run the tracker with the USB-to-TTL adapter's COM port:
 
 ```powershell
 python ".\backend\computer vision\eyetracking_opencv.py" --camera 1 --ocr-camera 2 --port COM3 --baud 115200
 ```
 
-Wire the adapter's **TXD** to the selected STM32 USART **RX**, and adapter **GND** to STM32 **GND**. Use 3.3 V UART logic; do not feed a 5 V adapter TX signal into STM32 RX. This is a one-way connection, so leave adapter RX and STM32 TX disconnected unless you later add a separate return protocol. Do not connect VCC unless the adapter is intentionally and safely powering the board.
+Wire adapter **TXD** to STM32 USART1 **PB7/RX**, adapter **RXD** to STM32 **PA9/TX**, and **GND** to STM32 **GND** using compatible 3.3 V UART logic. These pins are exposed by the board's Type C UART2-labelled connector. Do not connect VCC unless the adapter intentionally powers the board.
 
-The STM32 must use the same 115200 8N1 settings and treat LF as the end of the ASCII text `50`. A successful Python write means the USB serial driver accepted the bytes; it does not prove the STM32 or page-turn mechanism completed an action. LOOB logs the sent bytes as `[UART TX ...]` in the tracker terminal. A second serial-terminal app cannot use the same COM port while LOOB owns it.
+The MCU replies `ACK <request_id>` when it accepts the turn and `DONE <request_id>` when the existing timed sequence reaches state 6. `BUSY` or `ERROR` rejects or aborts the request. The bridge ignores telemetry and replies for other IDs, and requests capture only after matching ACK and DONE. Preview mode, timeout, errors and shutdown skip capture; motion is never retried automatically. The default host timeout is ten seconds, configurable with `--serial-completion-timeout`. `DONE` confirms the firmware sequence reached its final state; PWM servos provide no measured position feedback. The existing additional OCR settling delay starts after DONE.
+
+See [the UART protocol and timing reference](autobook_embedded/BOOK_UART_SEQUENCE_README.txt). A second serial terminal cannot use the adapter while LOOB owns its COM port.
 
 **Test 3 blinks** can run without the eye tracker or page-flipper hardware. It still opens the selected book camera and runs OCR after the countdown. If eye tracking is running, it uses the same pause-and-resume handoff as a manual scan.
 

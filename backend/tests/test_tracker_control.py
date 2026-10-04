@@ -56,7 +56,9 @@ def make_client(api, *, clock=None, send=None):
     client = TrackerControlClient(
         "http://local/v1/auto-scans", eye_camera_index=1, camera_index=2,
         settle_seconds=1.5,
-        send_command=send or (lambda command: api.calls.append(("SERIAL", command, None))),
+        send_command=send or (lambda command: (
+            api.calls.append(("SERIAL", command, None)) or True
+        )),
         request=api, **({"clock": clock} if clock else {}),
     )
     client.poll_once()
@@ -249,3 +251,90 @@ def test_dispatch_drops_gesture_if_busy_poll_arrives_before_worker_reserves():
     assert not any(path.endswith("/reserve") for path, _, _ in api.calls)
     assert not any(path == "SERIAL" for path, _, _ in api.calls)
     assert any("Page turn skipped" in message for _, message in client.drain_events())
+
+
+
+class CompletionAPI(FakeAPI):
+    def __call__(self, url, method="GET", payload=None):
+        result = super().__call__(url, method, payload)
+        if url.endswith("/reserve"):
+            self.client.applied("revision-one", True, eye_camera_state="released")
+            self.client.poll_once()
+        return result
+
+
+def make_completion_client(api, send, cancel=None):
+    client = TrackerControlClient(
+        "http://local", eye_camera_index=1, camera_index=2, settle_seconds=8,
+        send_command=send, cancel_command=cancel, request=api,
+    )
+    api.client = client
+    client.poll_once()
+    client.applied("revision-one", True)
+    client.poll_once()
+    return client
+
+
+def test_completion_waits_for_mcu_before_commit_and_keeps_polling():
+    api = CompletionAPI()
+    entered, done = threading.Event(), threading.Event()
+
+    def send(command):
+        entered.set()
+        assert done.wait(timeout=2)
+        return True
+
+    client = make_completion_client(api, send)
+    assert client.dispatch_flip()
+    assert entered.wait(timeout=1)
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
+    client.poll_once()
+    assert not any(path.endswith("/commit") for path, _, _ in api.calls)
+    done.set()
+    finish_dispatch(client)
+    assert sum(path.endswith("/commit") for path, _, _ in api.calls) == 1
+    assert any("acknowledged page-turn sequence completion" in message
+               for _, message in client.drain_events())
+
+
+def test_completion_shutdown_cancels_wait_and_never_commits():
+    api = CompletionAPI()
+    entered, cancelled = threading.Event(), threading.Event()
+
+    def send(command):
+        entered.set()
+        assert cancelled.wait(timeout=2)
+        return True
+
+    client = make_completion_client(api, send, cancelled.set)
+    assert client.dispatch_flip()
+    assert entered.wait(timeout=1)
+    client.close()
+    finish_dispatch(client)
+    assert cancelled.is_set()
+    assert not any(path.endswith("/commit") for path, _, _ in api.calls)
+    assert api.latest["status"] == "cancelled"
+
+
+def test_completion_missing_confirmation_and_preview_never_commit():
+    for result in (None, False):
+        api = CompletionAPI()
+        client = make_completion_client(api, lambda command: result)
+        assert client.dispatch_flip()
+        finish_dispatch(client)
+        assert not any(path.endswith("/commit") for path, _, _ in api.calls)
+        assert api.latest["status"] == "cancelled"
+
+
+def test_completion_timeout_cancels_reservation_without_commit():
+    api = CompletionAPI()
+
+    def send(command):
+        raise TimeoutError("No MCU DONE")
+
+    client = make_completion_client(api, send)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    assert not any(path.endswith("/commit") for path, _, _ in api.calls)
+    assert api.latest["status"] == "cancelled"

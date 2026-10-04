@@ -40,6 +40,17 @@ typedef enum {
   BOOK_STATE_7 = 7
 } BookDeviceState;
 
+typedef struct {
+  uint32_t command;
+  uint32_t requestId;
+} BookUartCommand;
+
+typedef struct {
+  uint32_t requestId;
+  const char *status;
+  const char *reason;
+} BookUartStatus;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,6 +62,7 @@ typedef enum {
 #define BOOK_STATE_4_TO_5_MS 1000U
 #define BOOK_STATE_5_TO_6_MS 1000U
 #define BOOK_UART_RX_BUFFER_SIZE 128U
+#define BOOK_UART_STATUS_CAPACITY 16U
 
 /* USER CODE END PD */
 
@@ -85,7 +97,7 @@ const osThreadAttr_t MainTask_attributes = {
 osThreadId_t UartTastHandle;
 const osThreadAttr_t UartTast_attributes = {
   .name = "UartTast",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
@@ -93,6 +105,10 @@ volatile bool bookSequenceActive = false;
 volatile bool bookSequenceStartRejected = false;
 volatile uint32_t bookLastUartCommand = 0;
 static uint32_t bookSequenceStateStartedMs;
+static uint32_t bookSequenceRequestId;
+static BookUartStatus bookUartStatusQueue[BOOK_UART_STATUS_CAPACITY];
+static uint8_t bookUartStatusHead, bookUartStatusTail, bookUartStatusCount;
+static bool bookUartTxNeedsResync;
 static uint8_t bookUartRxByte;
 static volatile uint8_t bookUartRxBuffer[BOOK_UART_RX_BUFFER_SIZE];
 static volatile uint16_t bookUartRxHead, bookUartRxTail;
@@ -127,7 +143,7 @@ void StartUartTask(void *argument);
 static bool RunBookClamp(float closingRPM);
 static void UpdateBookClampStatus(void);
 static void EnterBookState(BookDeviceState state);
-static bool ReadUartValue(uint32_t *value);
+static bool ReadUartCommand(BookUartCommand *command);
 static void ServiceBookSequence(uint32_t now);
 
 /* USER CODE END PFP */
@@ -570,10 +586,77 @@ static void EnterBookState(BookDeviceState state)
     bookStateActionAccepted = RunBookClamp(60.0f);
 }
 
+static bool CanReadBookCommand(void)
+{
+  taskENTER_CRITICAL();
+  /* Keep a terminal reply slot available throughout an accepted sequence. */
+  const bool available = bookUartStatusCount <= BOOK_UART_STATUS_CAPACITY - 2U;
+  taskEXIT_CRITICAL();
+  return available;
+}
+
+static void QueueBookStatus(const char *status, uint32_t requestId, const char *reason)
+{
+  const BookUartStatus message = {requestId, status, reason};
+  taskENTER_CRITICAL();
+  bookUartStatusQueue[bookUartStatusHead] = message;
+  bookUartStatusHead = (uint8_t)((bookUartStatusHead + 1U) % BOOK_UART_STATUS_CAPACITY);
+  ++bookUartStatusCount;
+  taskEXIT_CRITICAL();
+}
+
+static void HandleBookCommand(const BookUartCommand *command)
+{
+  bookLastUartCommand = command->command;
+  if (command->command != BOOK_UART_RUN_COMMAND) return;
+  if (bookSequenceActive)
+  {
+    QueueBookStatus("BUSY", command->requestId, NULL);
+    return;
+  }
+  EnterBookState(BOOK_STATE_2);
+  bookSequenceStartRejected = !bookStateActionAccepted;
+  bookSequenceActive = bookStateActionAccepted;
+  bookSequenceStateStartedMs = HAL_GetTick();
+  bookSequenceRequestId = command->requestId;
+  QueueBookStatus(bookSequenceActive ? "ACK" : "ERROR", command->requestId,
+                  bookSequenceActive ? NULL : "START_REJECTED");
+}
+
+static const char *BookClampFailure(void)
+{
+  GM6020_ClampStatus status;
+  if (!get6020ClampStatus(1, 2, &status)) return "FEEDBACK_LOST";
+  switch (status.state)
+  {
+    case GM6020_CLAMP_FEEDBACK_LOST: return "FEEDBACK_LOST";
+    case GM6020_CLAMP_TIMEOUT: return "TIMEOUT";
+    case GM6020_CLAMP_SERVICE_LATE: return "SERVICE_LATE";
+    default: return NULL;
+  }
+}
+
+static void AbortBookSequence(const char *reason)
+{
+  (void)stop6020(1, 2);
+  bookSequenceActive = false;
+  QueueBookStatus("ERROR", bookSequenceRequestId, reason);
+}
+
 /* Start/service the automatic sequence only from MainTask. */
 static void ServiceBookSequence(uint32_t now)
 {
   if (!bookSequenceActive) return;
+
+  if (bookDeviceState == BOOK_STATE_2)
+  {
+    const char *reason = BookClampFailure();
+    if (reason != NULL)
+    {
+      AbortBookSequence(reason);
+      return;
+    }
+  }
 
   uint32_t delayMs;
   switch (bookDeviceState)
@@ -582,25 +665,39 @@ static void ServiceBookSequence(uint32_t now)
     case BOOK_STATE_3: delayMs = BOOK_STATE_3_TO_4_MS; break;
     case BOOK_STATE_4: delayMs = BOOK_STATE_4_TO_5_MS; break;
     case BOOK_STATE_5: delayMs = BOOK_STATE_5_TO_6_MS; break;
-    default: bookSequenceActive = false; return;
+    default: AbortBookSequence("INVALID_STATE"); return;
   }
   if ((uint32_t)(now - bookSequenceStateStartedMs) < delayMs) return;
 
   /* Timer-only transitions. State 3 stops drive before changing servo outputs. */
-  EnterBookState((BookDeviceState)(bookDeviceState + 1));
+  if (bookDeviceState == BOOK_STATE_2)
+  {
+    /* Do not let the motor service set a fault between the check and stop. */
+    taskENTER_CRITICAL();
+    const char *reason = BookClampFailure();
+    if (reason == NULL) EnterBookState(BOOK_STATE_3);
+    taskEXIT_CRITICAL();
+    if (reason != NULL) { AbortBookSequence(reason); return; }
+  }
+  else EnterBookState((BookDeviceState)(bookDeviceState + 1));
   bookSequenceStateStartedMs = HAL_GetTick();
-  if (bookDeviceState == BOOK_STATE_6) bookSequenceActive = false;
+  if (!bookStateActionAccepted) AbortBookSequence("STOP_REJECTED");
+  else if (bookDeviceState == BOOK_STATE_6)
+  {
+    bookSequenceActive = false;
+    QueueBookStatus("DONE", bookSequenceRequestId, NULL);
+  }
 }
 
-/* UART command input: decimal unsigned values terminated by CR or LF.
+/* UART command input: command and optional request ID, terminated by CR or LF.
  * Call from exactly one task. No blocking receive or heap allocation.
  * Invalid/overflowed lines are discarded in full, rather than partly parsed. */
-static bool ReadUartValue(uint32_t *value)
+static bool ReadUartCommand(BookUartCommand *command)
 {
-  static uint32_t parsed;
+  static uint32_t parsed, parsedCommand;
   static uint8_t digits;
-  static bool discardLine;
-  if (value == NULL) return false;
+  static bool discardLine, readingId;
+  if (command == NULL) return false;
 
   /* Recover interrupt reception after a HAL error without blocking a task. */
   taskENTER_CRITICAL();
@@ -618,7 +715,7 @@ static bool ReadUartValue(uint32_t *value)
       /* Flush queued fragments. Resume after the next received line ending. */
       bookUartRxTail = bookUartRxHead;
       bookUartRxOverflow = false;
-      parsed = 0; digits = 0; discardLine = true;
+      parsed = 0; parsedCommand = 0; digits = 0; readingId = false; discardLine = true;
     }
     if (bookUartRxTail == bookUartRxHead)
     {
@@ -632,13 +729,18 @@ static bool ReadUartValue(uint32_t *value)
     if (byte == '\r' || byte == '\n')
     {
       const bool accepted = digits != 0 && !discardLine;
-      const uint32_t result = parsed;
-      parsed = 0; digits = 0; discardLine = false;
-      if (accepted) { *value = result; return true; }
+      const BookUartCommand result = {readingId ? parsedCommand : parsed,
+                                      readingId ? parsed : 0U};
+      parsed = 0; parsedCommand = 0; digits = 0; discardLine = false; readingId = false;
+      if (accepted) { *command = result; return true; }
     }
     else if (!discardLine)
     {
-      if (byte < '0' || byte > '9' || digits >= 10U ||
+      if (byte == ' ' && digits != 0U && !readingId)
+      {
+        parsedCommand = parsed; parsed = 0; digits = 0; readingId = true;
+      }
+      else if (byte < '0' || byte > '9' || digits >= 10U ||
           parsed > (UINT32_MAX - (uint32_t)(byte - '0')) / 10U)
         discardLine = true;
       else { parsed = parsed * 10U + (uint32_t)(byte - '0'); ++digits; }
@@ -731,18 +833,9 @@ void StartMainTask(void *argument)
   {
     const uint32_t now = HAL_GetTick();
     motorPos = get6020Pos(1, 2);
-    uint32_t command;
-    while (ReadUartValue(&command))
-    {
-      bookLastUartCommand = command;
-      if (command == BOOK_UART_RUN_COMMAND && !bookSequenceActive)
-      {
-        EnterBookState(BOOK_STATE_2);
-        bookSequenceStartRejected = !bookStateActionAccepted;
-        bookSequenceActive = bookStateActionAccepted;
-        bookSequenceStateStartedMs = HAL_GetTick();
-      }
-    }
+    BookUartCommand command;
+    while (CanReadBookCommand() && ReadUartCommand(&command))
+      HandleBookCommand(&command);
     ServiceBookSequence(HAL_GetTick());
     const bool pressed = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
     if (pressed != buttonSample)
@@ -778,19 +871,45 @@ void StartMainTask(void *argument)
 void StartUartTask(void *argument)
 {
   /* USER CODE BEGIN StartUartTask */
-  char uartBuff[16];
+  (void)argument;
+  char uartBuff[64];
   /* Infinite loop */
   for(;;)
   {
-	int length;
-	if (motorPos == GM6020_INVALID_POSITION)
-		length = snprintf(uartBuff, sizeof(uartBuff), "offline\r\n");
-	else
-		length = snprintf(uartBuff, sizeof(uartBuff),
-						  "%u\r\n", (unsigned)motorPos);
+    BookUartStatus message;
+    taskENTER_CRITICAL();
+    const bool hasStatus = bookUartStatusCount != 0U;
+    if (hasStatus) message = bookUartStatusQueue[bookUartStatusTail];
+    taskEXIT_CRITICAL();
 
-    if (length > 0 && (size_t)length < sizeof(uartBuff)) {
-    	HAL_UART_Transmit(&huart1, (uint8_t *)uartBuff, (uint16_t)length, 10);
+    int length;
+    if (hasStatus)
+      length = snprintf(uartBuff, sizeof(uartBuff), "%s %lu%s%s\r\n",
+                        message.status, (unsigned long)message.requestId,
+                        message.reason != NULL ? " " : "",
+                        message.reason != NULL ? message.reason : "");
+    else if (motorPos == GM6020_INVALID_POSITION)
+      length = snprintf(uartBuff, sizeof(uartBuff), "offline\r\n");
+    else
+      length = snprintf(uartBuff, sizeof(uartBuff), "%u\r\n", (unsigned)motorPos);
+
+    if (length > 0 && (size_t)length < sizeof(uartBuff))
+    {
+      /* A failed blocking TX may leave a partial line on the host. */
+      if (bookUartTxNeedsResync)
+        bookUartTxNeedsResync = HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 10) != HAL_OK;
+      if (!bookUartTxNeedsResync)
+      {
+        bookUartTxNeedsResync = HAL_UART_Transmit(&huart1, (uint8_t *)uartBuff,
+                                                (uint16_t)length, 10) != HAL_OK;
+        if (hasStatus && !bookUartTxNeedsResync)
+        {
+          taskENTER_CRITICAL();
+          bookUartStatusTail = (uint8_t)((bookUartStatusTail + 1U) % BOOK_UART_STATUS_CAPACITY);
+          --bookUartStatusCount;
+          taskEXIT_CRITICAL();
+        }
+      }
     }
     osDelay(10);
   }

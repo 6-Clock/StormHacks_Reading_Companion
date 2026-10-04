@@ -44,7 +44,8 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None) -> 
 class TrackerControlClient:
     def __init__(
         self, api_url: str, *, eye_camera_index: int, camera_index: int | None,
-        settle_seconds: float, send_command: Callable[[str], None],
+        settle_seconds: float, send_command: Callable[[str], bool],
+        cancel_command: Callable[[], None] | None = None,
         request: Callable = request_json, clock: Callable = time.monotonic,
     ) -> None:
         # Keep the existing --auto-scan-api flag compatible with its full endpoint.
@@ -55,6 +56,7 @@ class TrackerControlClient:
         self.session_id = uuid4().hex
         self._request = request
         self._send_command = send_command
+        self._cancel_command = cancel_command
         self._clock = clock
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -299,9 +301,19 @@ class TrackerControlClient:
             if expiry - time.time() < 1.5 or self._stop.is_set() or self._closing:
                 raise ValueError("Page-turn reservation expired while releasing the eye camera")
             # No camera-loop callback writes serial until reserve succeeds.
-            self._send_command("flip right")
+            self._event("command", "Page-turn request started; waiting for MCU sequence completion.")
+            result = self._send_command("flip right")
+            if self._closing or self._stop.is_set():
+                self._cancel_reservation(job_id)
+                return
+            if result is False:
+                self._event("command", "Page-turn preview; no serial command was sent.")
+                self._cancel_reservation(job_id)
+                return
+            if result is not True:
+                raise ValueError("Serial sender did not confirm MCU sequence completion")
             sent = True
-            self._event("command", "Reserved page turn: flip right dispatched.")
+            self._event("command", "MCU acknowledged page-turn sequence completion.")
             commit_url = f"{self.base_url}/v1/page-turns/{job_id}/commit"
             try:
                 committed = self._request(commit_url, "POST", {})
@@ -314,7 +326,7 @@ class TrackerControlClient:
             next_stage = "capture" if self.camera_index is not None else "rearming"
             self._event("auto_scan", f"Page turn {job_id}: settling before {next_stage}.")
         except (OSError, ValueError) as error:
-            outcome = "sent; coordination failed" if sent else "blocked"
+            outcome = "completed; coordination failed" if sent else "failed"
             self._event("command", f"Page turn {outcome}: {error}")
             if job_id and not sent:
                 self._cancel_reservation(job_id)
@@ -329,6 +341,8 @@ class TrackerControlClient:
         """Stop commands while keeping the camera-release heartbeat alive."""
         with self._lock:
             self._closing = True
+        if self._cancel_command is not None:
+            self._cancel_command()
 
     def close(self) -> None:
         self.begin_shutdown()

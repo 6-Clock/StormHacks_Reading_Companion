@@ -29,6 +29,10 @@ from read_mode_state import ReadModeController  # noqa: E402
 
 from app.services.camera_lease import CameraLease  # noqa: E402
 from app.services.eye_publisher import EyeTelemetryPublisher  # noqa: E402
+from app.services.serial_commands import (  # noqa: E402
+    DEFAULT_COMPLETION_TIMEOUT,
+    SerialCommandSender,
+)
 from app.services.tracker_control import TrackerControlClient  # noqa: E402
 
 DEFAULT_CAMERA_INDEX = 1
@@ -40,7 +44,6 @@ CAMERA_GAZE_Y = (0.30, 0.70)
 FACE_CENTER_X = (0.38, 0.62)
 MIN_FACE_WIDTH_PIXELS = 55
 GAZE_SMOOTHING = 0.35
-UART_COMMANDS = {"flip right": "50"}
 
 LEFT_EYE = {"outer": 33, "inner": 133, "top": 159, "bottom": 145, "iris": 468}
 RIGHT_EYE = {"outer": 263, "inner": 362, "top": 386, "bottom": 374, "iris": 473}
@@ -200,55 +203,6 @@ class LatestFrameReader:
         self.request_stop()
 
 
-class SerialCommandSender:
-    """Transmit LF-delimited commands through a USB-to-TTL UART adapter."""
-
-    def __init__(self, port: str | None, baud: int) -> None:
-        self.connection: serial.Serial | None = None
-        if port:
-            # The STM32 link is TX-only: USB-to-TTL TXD -> STM32 RX. Make the
-            # UART frame explicit instead of relying on pyserial defaults.
-            self.connection = serial.Serial(
-                port=port,
-                baudrate=baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0,
-                write_timeout=1,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False,
-            )
-            print(f"UART TX connected: {port} at {baud} baud (8N1, no flow control)")
-        else:
-            print("UART preview mode: use --port COM3 when the USB-to-TTL adapter is connected.")
-
-    def send(self, command: str) -> None:
-        try:
-            uart_command = UART_COMMANDS[command]
-        except KeyError as error:
-            raise ValueError(f"Unsupported UART command: {command!r}") from error
-
-        payload = f"{uart_command}\n".encode("ascii")
-        if self.connection is not None:
-            # write_timeout=1 bounds the send. flush() can wait indefinitely on
-            # some drivers and would outlive the coordinator's reservation.
-            written = self.connection.write(payload)
-            if written != len(payload):
-                raise serial.SerialTimeoutException("Incomplete page-turn command write")
-            print(
-                f"[UART TX {self.connection.port} {self.connection.baudrate} 8N1] "
-                f"{command!r} -> {payload!r}"
-            )
-        else:
-            print(f"[UART PREVIEW] {command!r} -> {payload!r}")
-
-    def close(self) -> None:
-        if self.connection is not None and self.connection.is_open:
-            self.connection.close()
-
-
 class GazeCalibration:
     """Per-user neutral iris-position calibration."""
 
@@ -342,6 +296,10 @@ def main() -> int:
         default=115200,
         help="USB-to-TTL / STM32 UART baud rate (default: 115200; 8N1, no flow control).",
     )
+    parser.add_argument(
+        "--serial-completion-timeout", type=float, default=DEFAULT_COMPLETION_TIMEOUT,
+        help="Seconds to wait for MCU ACK and DONE (default: 10). Never retries motion.",
+    )
     parser.add_argument("--width", type=int, default=DEFAULT_CAPTURE_WIDTH, help="Requested camera width (default: 640).")
     parser.add_argument("--height", type=int, default=DEFAULT_CAPTURE_HEIGHT, help="Requested camera height (default: 480).")
     parser.add_argument("--fps", type=int, default=DEFAULT_CAPTURE_FPS, help="Requested camera FPS (default: 30).")
@@ -360,6 +318,8 @@ def main() -> int:
     if not diagnostics_logger.handlers:
         diagnostics_logger.addHandler(logging.StreamHandler())
     diagnostics_logger.propagate = False
+    if not math.isfinite(args.serial_completion_timeout) or args.serial_completion_timeout <= 0:
+        parser.error("--serial-completion-timeout must be a positive finite number.")
     if args.ocr_camera is not None and args.ocr_camera == args.camera:
         parser.error("--ocr-camera must be different from --camera so each camera has one job.")
     if not 8 <= args.ocr_settle_seconds <= 30:
@@ -369,7 +329,9 @@ def main() -> int:
     reader = LatestFrameReader(args.camera, args.width, args.height, args.fps)
 
     try:
-        command_sender = SerialCommandSender(args.port, args.baud)
+        command_sender = SerialCommandSender(
+            args.port, args.baud, completion_timeout=args.serial_completion_timeout,
+        )
     except serial.SerialException as error:
         print(f"Could not open serial port {args.port}: {error}")
         reader.close()
@@ -392,6 +354,7 @@ def main() -> int:
         camera_index=args.ocr_camera,
         settle_seconds=args.ocr_settle_seconds,
         send_command=command_sender.send,
+        cancel_command=command_sender.cancel,
     )
     gaze_calibration = GazeCalibration()
     blink_detector = RelativeBlinkDetector(args.blink_sensitivity)
