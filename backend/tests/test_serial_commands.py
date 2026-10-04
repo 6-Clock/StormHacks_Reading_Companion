@@ -15,13 +15,14 @@ class FakeSerial:
         self.chunks = []
         self.read_entered = threading.Event()
         self.options = kwargs
+        self.timeout = kwargs.get("timeout", 0.1)
 
     def reset_input_buffer(self):
         self.chunks.clear()
 
     def write(self, payload):
         self.writes.append(payload)
-        self.request_id = payload.decode().split()[1]
+        self.request_id = payload.decode().splitlines()[-1].split()[1]
         if self.replies:
             self.chunks.extend(self.replies(self.request_id))
         return len(payload) if self.write_count is None else self.write_count
@@ -59,7 +60,7 @@ def test_waits_for_matching_ack_then_done_amid_fragmented_telemetry():
     ])
     assert sender.send("flip right") is True
     assert len(connection.writes) == 1
-    assert connection.writes[0] == f"50 {connection.request_id}\n".encode()
+    assert connection.writes[0] == f"!\n50 {connection.request_id}\n".encode()
     assert 0 < int(connection.request_id) <= 0xFFFFFFFF
 
 
@@ -99,6 +100,123 @@ def test_partial_write_is_not_retried():
     sender, connection = sender_with(write_count=2)
     with pytest.raises(OSError, match="Incomplete page-turn command write"):
         sender.send("flip right")
+    assert len(connection.writes) == 1
+
+
+class McuSerial(FakeSerial):
+    def __init__(self, *, write_error=False, **kwargs):
+        super().__init__(**kwargs)
+        self.write_error = write_error
+        self.pending = bytearray()
+        self.executed = []
+
+    def write(self, payload):
+        written = super().write(payload)
+        self.pending.extend(payload[:written])
+        while b"\n" in self.pending:
+            line, _, rest = self.pending.partition(b"\n")
+            self.pending = bytearray(rest)
+            fields = bytes(line).split(b" ")
+            if fields == [b"50"]:
+                request_id = b"0"
+            elif len(fields) == 2 and fields[0] == b"50" and fields[1].isdigit():
+                request_id = fields[1]
+            else:
+                continue
+            self.executed.append(request_id)
+            self.chunks.append(b"ACK " + request_id + b"\r\nDONE " + request_id + b"\r\n")
+        if self.write_error:
+            raise OSError("write timeout")
+        return written
+
+
+@pytest.mark.parametrize("written", range(7))
+@pytest.mark.parametrize("write_error", [False, True])
+def test_next_request_discards_partial_write_without_executing_it(
+    monkeypatch, written, write_error,
+):
+    monkeypatch.setattr("app.services.serial_commands.secrets.randbelow", lambda maximum: 7)
+    connection = McuSerial(write_count=written, write_error=write_error)
+    sender = SerialCommandSender("COM3", 115200, serial_factory=lambda **kwargs: connection)
+    message = "write timeout" if write_error else "Incomplete page-turn command write"
+    with pytest.raises(OSError, match=message):
+        sender.send("flip right")
+    assert connection.executed == []
+    assert len(connection.writes) == 1
+    connection.write_count = None
+    connection.write_error = False
+    assert sender.send("flip right") is True
+    assert connection.executed == [b"9"]
+    assert len(connection.writes) == 2
+
+
+@pytest.mark.parametrize("fragment", [b"50", b"50 123", b"50 ", b"garbage"])
+def test_new_sender_invalidates_prior_host_fragment_without_motion(fragment):
+    connection = McuSerial()
+    connection.pending.extend(fragment)
+    sender = SerialCommandSender("COM3", 115200, serial_factory=lambda **kwargs: connection)
+    assert sender.send("flip right") is True
+    assert connection.executed == [connection.request_id.encode()]
+
+
+def test_frame_reset_does_not_repeat_completed_motion(monkeypatch):
+    monkeypatch.setattr("app.services.serial_commands.secrets.randbelow", lambda maximum: 7)
+    connection = McuSerial()
+    sender = SerialCommandSender("COM3", 115200, serial_factory=lambda **kwargs: connection)
+    assert sender.send("flip right") is True
+    assert sender.send("flip right") is True
+    assert connection.executed == [b"8", b"9"]
+
+
+class TimedSerial(FakeSerial):
+    def __init__(self, *, completion_at):
+        super().__init__()
+        self.now = 0.0
+        self.completion_at = completion_at
+        self.read_timeouts = []
+
+    def write(self, payload):
+        written = super().write(payload)
+        self.events = [
+            (0.001, f"ACK {self.request_id}\r\n".encode()),
+            (self.completion_at, f"DONE {self.request_id}\r\n".encode()),
+        ]
+        return written
+
+    def read(self, size):
+        self.read_timeouts.append(self.timeout)
+        self.now = round(self.now + self.timeout, 12)
+        result = b""
+        while self.events and self.events[0][0] <= self.now:
+            result += self.events.pop(0)[1]
+        assert len(result) < size
+        return result
+
+
+@pytest.mark.parametrize("timeout,completion_at", [(0.025, 0.015), (4.05, 4.01)])
+def test_completion_received_before_deadline_survives_final_timed_read(
+    monkeypatch, timeout, completion_at,
+):
+    connection = TimedSerial(completion_at=completion_at)
+    monkeypatch.setattr("app.services.serial_commands.time.monotonic", lambda: connection.now)
+    sender = SerialCommandSender(
+        "COM3", 115200, completion_timeout=timeout, serial_factory=lambda **kwargs: connection,
+    )
+    assert sender.send("flip right") is True
+    assert connection.now == pytest.approx(timeout)
+    assert 0 < connection.read_timeouts[-1] < 0.1
+    assert len(connection.writes) == 1
+
+
+def test_completion_after_deadline_is_not_accepted_or_retried(monkeypatch):
+    connection = TimedSerial(completion_at=4.06)
+    monkeypatch.setattr("app.services.serial_commands.time.monotonic", lambda: connection.now)
+    sender = SerialCommandSender(
+        "COM3", 115200, completion_timeout=4.05, serial_factory=lambda **kwargs: connection,
+    )
+    with pytest.raises(TimeoutError, match="DONE after ACK"):
+        sender.send("flip right")
+    assert connection.now == pytest.approx(4.05)
     assert len(connection.writes) == 1
 
 
@@ -144,7 +262,7 @@ def test_request_id_changes_between_commands(monkeypatch):
     sender, connection = sender_with(lambda rid: [f"ACK {rid}\r\nDONE {rid}\r\n".encode()])
     assert sender.send("flip right") is True
     assert sender.send("flip right") is True
-    assert connection.writes == [b"50 8\n", b"50 9\n"]
+    assert connection.writes == [b"!\n50 8\n", b"!\n50 9\n"]
 
 
 def test_stale_nonzero_transaction_cannot_confirm_current_request(monkeypatch):
@@ -154,7 +272,7 @@ def test_stale_nonzero_transaction_cannot_confirm_current_request(monkeypatch):
     )
     with pytest.raises(TimeoutError, match="waiting for MCU ACK"):
         sender.send("flip right")
-    assert connection.writes == [b"50 8\n"]
+    assert connection.writes == [b"!\n50 8\n"]
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])

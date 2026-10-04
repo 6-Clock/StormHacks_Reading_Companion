@@ -1,4 +1,5 @@
 import threading
+import urllib.error
 
 from app.services.tracker_control import TrackerControlClient
 
@@ -9,6 +10,8 @@ class FakeAPI:
         self.desired = {"revision": "one", "blink_only": True}
         self.unavailable = False
         self.capture_error = False
+        self.capture_response_lost = False
+        self.job = None
 
     def __call__(self, url, method="GET", payload=None):
         path = url.removeprefix("http://local")
@@ -22,7 +25,18 @@ class FakeAPI:
         if path == "/v1/scan-jobs":
             if self.capture_error:
                 raise TimeoutError("Capture response lost")
-            return {"job_id": "job-one", "status": "queued"}
+            self.job = {"job_id": "job-one", "status": "waiting_for_eye_camera",
+                        "trigger_id": payload["trigger_id"]}
+            self.desired["camera_pause_job_id"] = "job-one"
+            if self.capture_response_lost:
+                raise TimeoutError("Capture response lost")
+            return self.job.copy()
+        if path == "/v1/scan-jobs/latest":
+            return self.job.copy() if self.job else {"job_id": None, "status": "idle"}
+        if path == "/v1/scan-jobs/job-one":
+            if self.job is None:
+                raise urllib.error.HTTPError(url, 404, "Job not found", None, None)
+            return self.job.copy()
         raise AssertionError(f"Unexpected API call: {path}")
 
 
@@ -61,7 +75,8 @@ def test_mcu_completion_precedes_capture_without_additional_host_delay():
     assert payload["camera_index"] == 2
     assert payload["trigger_id"]
     assert "settle_seconds" not in payload
-    assert not client.snapshot().turns_blocked
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
 
 
 def test_api_outage_does_not_gate_turns_or_reset_blink_mode():
@@ -79,6 +94,9 @@ def test_api_outage_does_not_gate_turns_or_reset_blink_mode():
     finish_dispatch(client)
     assert sum(path == "SERIAL" for path, _, _ in api.calls) == 1
     assert any("completed; capture failed" in message for _, message in client.drain_events())
+    api.unavailable = False
+    client.poll_once()
+    assert not client.snapshot().turns_blocked
 
 
 def test_camera_pause_blocks_until_release_then_allows_reopen():
@@ -139,6 +157,8 @@ def test_capture_failure_never_retries_serial():
     finish_dispatch(client)
     assert sum(path == "SERIAL" for path, _, _ in api.calls) == 1
     assert sum(path == "/v1/scan-jobs" for path, _, _ in api.calls) == 1
+    assert client.snapshot().turns_blocked
+    client.poll_once()
     assert not client.snapshot().turns_blocked
 
 
@@ -236,3 +256,128 @@ def test_missing_sender_confirmation_never_captures():
     assert client.dispatch_flip()
     finish_dispatch(client)
     assert not any(path == "/v1/scan-jobs" for path, _, _ in api.calls)
+
+
+def test_capture_handoff_blocks_between_post_and_pause_poll_until_camera_reopens():
+    api = FakeAPI()
+    client = make_client(api)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    assert client.snapshot().turns_blocked
+    assert not client.snapshot().should_pause
+    assert not client.dispatch_flip()
+    client.poll_once()
+    assert client.snapshot().should_pause
+    assert not client.dispatch_flip()
+    client.applied("one", True, eye_camera_state="released")
+    client.poll_once()
+    api.job["status"] = "captured"
+    api.desired["camera_pause_job_id"] = None
+    client.poll_once()
+    assert not client.snapshot().should_pause
+    assert client.snapshot().turns_blocked
+    client.applied("one", True, eye_camera_state="open")
+    assert not client.snapshot().turns_blocked
+    assert sum(path == "SERIAL" for path, _, _ in api.calls) == 1
+
+
+def test_fast_capture_completion_or_cancellation_before_pause_poll_unblocks():
+    for status in ("captured", "cancelled", "failed"):
+        api = FakeAPI()
+        client = make_client(api)
+        assert client.dispatch_flip()
+        finish_dispatch(client)
+        api.job["status"] = status
+        api.desired["camera_pause_job_id"] = None
+        client.poll_once()
+        assert not client.snapshot().turns_blocked
+
+
+def test_unobserved_pause_does_not_unblock_a_still_active_capture():
+    api = FakeAPI()
+    client = make_client(api)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    api.desired["camera_pause_job_id"] = None
+    client.poll_once()
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
+    api.desired["camera_pause_job_id"] = "job-one"
+    client.poll_once()
+    assert client.snapshot().should_pause
+
+
+def test_stale_settings_response_cannot_clear_new_capture_handoff():
+    api = FakeAPI()
+    client = make_client(api)
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed_request(url, method="GET", payload=None):
+        if url.endswith("/tracker-settings"):
+            stale = api(url, method, payload)
+            entered.set()
+            assert release.wait(2)
+            return stale
+        return api(url, method, payload)
+
+    client._request = delayed_request
+    poll = threading.Thread(target=client.poll_once)
+    poll.start()
+    try:
+        assert entered.wait(1)
+        assert client.dispatch_flip()
+        finish_dispatch(client)
+    finally:
+        release.set()
+        poll.join(2)
+    assert not poll.is_alive()
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
+
+
+def test_pending_capture_survives_outage_and_resolves_after_reconnection():
+    api = FakeAPI()
+    client = make_client(api)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    api.unavailable = True
+    client.poll_once()
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
+    api.unavailable = False
+    api.job["status"] = "captured"
+    api.desired["camera_pause_job_id"] = None
+    client.poll_once()
+    assert not client.snapshot().turns_blocked
+
+
+def test_lost_capture_response_recovers_job_without_retrying_motion_or_post():
+    api = FakeAPI()
+    api.capture_response_lost = True
+    client = make_client(api)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    assert client.snapshot().turns_blocked
+    assert not client.dispatch_flip()
+    client.poll_once()
+    assert client.snapshot().should_pause
+    client.applied("one", True, eye_camera_state="released")
+    client.poll_once()
+    api.job["status"] = "captured"
+    api.desired["camera_pause_job_id"] = None
+    client.poll_once()
+    client.applied("one", True, eye_camera_state="open")
+    assert not client.snapshot().turns_blocked
+    assert sum(path == "SERIAL" for path, _, _ in api.calls) == 1
+    assert sum(path == "/v1/scan-jobs" for path, _, _ in api.calls) == 1
+
+
+def test_server_restart_forgets_pending_job_without_leaving_turns_blocked():
+    api = FakeAPI()
+    client = make_client(api)
+    assert client.dispatch_flip()
+    finish_dispatch(client)
+    api.job = None
+    api.desired["camera_pause_job_id"] = None
+    client.poll_once()
+    assert not client.snapshot().turns_blocked

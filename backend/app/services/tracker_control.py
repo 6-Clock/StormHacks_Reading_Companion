@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 POLL_SECONDS = 0.5
 CONTROL_STALE_SECONDS = 2.5
+CAPTURE_TERMINAL_STATUSES = {"captured", "accepted", "rejected", "cancelled", "failed", "idle"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,7 @@ class TrackerControlClient:
         self._applied: tuple[str, bool] | None = None
         self._acknowledged_revision: str | None = None
         self._camera_pause_job_id: str | None = None
+        self._capture_pending: tuple[str, str | None] | None = None
         self._eye_camera_state = "released"
         self._dispatching = False
         self._failed = False
@@ -102,7 +105,8 @@ class TrackerControlClient:
                 blink_only=self._desired_blink_only,
                 revision=self._desired_revision,
                 turns_blocked=(
-                    self._dispatching or paused or closing or self._eye_camera_state != "open"
+                    self._dispatching or self._capture_pending is not None
+                    or paused or closing or self._eye_camera_state != "open"
                 ),
                 connected=connected,
                 camera_pause_job_id=self._camera_pause_job_id,
@@ -125,6 +129,8 @@ class TrackerControlClient:
             self._poll_wakeup.set()
 
     def poll_once(self) -> None:
+        with self._lock:
+            capture_pending = self._capture_pending
         try:
             desired = self._request(f"{self.base_url}/v1/tracker-settings")
             if not isinstance(desired.get("blink_only"), bool) or not desired.get("revision"):
@@ -138,6 +144,14 @@ class TrackerControlClient:
                 eye_camera_state = self._eye_camera_state
                 if self._closing and eye_camera_state == "released":
                     applied = (desired["revision"], desired["blink_only"])
+            if capture_pending is not None:
+                resolved = self._resolve_capture_pending(
+                    capture_pending, desired.get("camera_pause_job_id"),
+                )
+                with self._lock:
+                    # A settings request begun before the POST cannot release its new handoff.
+                    if self._capture_pending == capture_pending:
+                        self._capture_pending = resolved
             if applied == (desired["revision"], desired["blink_only"]):
                 self._request(f"{self.base_url}/v1/tracker-settings/ack", "POST", {
                     "revision": applied[0], "blink_only": applied[1],
@@ -160,6 +174,26 @@ class TrackerControlClient:
                 self._event("tracker", f"Tracker controls unavailable: {error}")
             self._failed = True
 
+    def _resolve_capture_pending(
+        self, pending: tuple[str, str | None], pause_job_id: str | None,
+    ) -> tuple[str, str | None] | None:
+        trigger_id, job_id = pending
+        if job_id is not None and pause_job_id == job_id:
+            return None
+        path = "latest" if job_id is None else job_id
+        try:
+            job = self._request(f"{self.base_url}/v1/scan-jobs/{path}")
+        except urllib.error.HTTPError as error:
+            if job_id is not None and error.code == 404:
+                return None
+            raise
+        if job.get("status") in CAPTURE_TERMINAL_STATUSES:
+            return None
+        if job_id is None and job.get("trigger_id") == trigger_id and job.get("job_id"):
+            job_id = job["job_id"]
+            return None if pause_job_id == job_id else (trigger_id, job_id)
+        return pending
+
     def _poll_forever(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
@@ -170,6 +204,7 @@ class TrackerControlClient:
         with self._lock:
             if (
                 self._dispatching or self._closing or self._stop.is_set()
+                or self._capture_pending is not None
                 or self._camera_pause_job_id is not None or self._eye_camera_state != "open"
             ):
                 return False
@@ -182,6 +217,8 @@ class TrackerControlClient:
 
     def _dispatch_flip(self) -> None:
         completed = False
+        capture_trigger_id = None
+        capture_registered = False
         try:
             if self._closing or self._stop.is_set():
                 return
@@ -199,17 +236,24 @@ class TrackerControlClient:
             completed = True
             self._event("command", "MCU acknowledged page-turn sequence completion.")
             if self.camera_index is not None:
+                capture_trigger_id = uuid4().hex
                 job = self._request(f"{self.base_url}/v1/scan-jobs", "POST", {
-                    "source": "automatic", "trigger_id": uuid4().hex,
+                    "source": "automatic", "trigger_id": capture_trigger_id,
                     "eye_camera_index": self.eye_camera_index, "camera_index": self.camera_index,
                 })
+                with self._lock:
+                    self._capture_pending = (capture_trigger_id, job["job_id"])
+                capture_registered = True
                 self._event("auto_scan", f"Page capture requested: {job['job_id']}.")
         except (OSError, ValueError, KeyError) as error:
             outcome = "completed; capture failed" if completed else "failed"
             self._event("command", f"Page-turn command {outcome}: {error}")
         finally:
             with self._lock:
+                if capture_trigger_id is not None and not capture_registered:
+                    self._capture_pending = (capture_trigger_id, None)
                 self._dispatching = False
+            self._poll_wakeup.set()
 
     def begin_shutdown(self) -> None:
         with self._lock:

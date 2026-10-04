@@ -157,6 +157,32 @@ int main(void){
   feed("\n50\n");assert(ReadUartCommand(&v)&&v.command==50);assert(!ReadUartCommand(&v));
   UART_HandleTypeDef other;bookUartRxByte='5';HAL_UART_RxCpltCallback(&other);assert(!ReadUartCommand(&v));
 
+  /* The invalid marker must cancel partial legacy commands before its newline. */
+  const char *fragments[]={"50","50 ","50 1234"};
+  for(unsigned parsedFragment=0;parsedFragment<2;++parsedFragment){
+    for(unsigned i=0;i<sizeof(fragments)/sizeof(fragments[0]);++i){
+      reset();feed("\n");assert(!ReadUartCommand(&v));feed(fragments[i]);
+      if(parsedFragment)assert(!ReadUartCommand(&v));
+      feed("!\n50 77\n");
+      assert(ReadUartCommand(&v)&&v.command==50&&v.requestId==77);
+      HandleBookCommand(&v);assert(starts==1&&bookSequenceRequestId==77);
+      assert(!ReadUartCommand(&v));runUart(1);
+      assert(strcmp(transmitted,"ACK 77\r\n")==0);
+    }
+  }
+  reset();feed("50 11\n");assert(ReadUartCommand(&v)&&v.requestId==11);HandleBookCommand(&v);
+  feed("!\n50 77\n");assert(ReadUartCommand(&v)&&v.requestId==77);HandleBookCommand(&v);
+  assert(!ReadUartCommand(&v)&&starts==1&&bookSequenceRequestId==11);
+  runUart(2);assert(strcmp(transmitted,"ACK 11\r\nBUSY 77\r\n")==0);
+  for(unsigned error=0;error<2;++error){
+    reset();
+    if(error){feed("50 12");HAL_UART_ErrorCallback(&huart1);}
+    else for(unsigned i=0;i<200;++i)feed("1");
+    assert(!ReadUartCommand(&v));feed("!\n50 77\n");
+    assert(ReadUartCommand(&v)&&v.command==50&&v.requestId==77);
+    HandleBookCommand(&v);assert(starts==1&&!ReadUartCommand(&v));
+  }
+
   reset();if(!setjmp(done))StartMainTask(NULL);
   const uint16_t expected[6][4]={{2100,1200,1800,800},{2100,1600,1400,800},{1000,1600,1400,800},{1000,1600,1400,1800},{1000,1600,2100,1800},{1000,1600,1400,1800}};
   assert(entries==6&&starts==1&&pwm_starts==4);

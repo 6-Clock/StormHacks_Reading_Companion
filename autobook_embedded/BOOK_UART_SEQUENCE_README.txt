@@ -60,6 +60,9 @@ ReadUartCommand is a nonblocking unsigned-decimal line parser. An optional
 request ID follows exactly one ASCII space. Interrupt RX uses
 a 128-byte ring. Malformed/overflowed commands are discarded; no partial
 command is executed. Commands without a line ending wait for completion.
+The backend prefixes each fresh request with "!" followed by LF to discard any
+unfinished command. A bare line ending could instead execute a partial legacy
+"50" command, so it is not a safe framing reset.
 Use the Type C UART2-labelled connector (STM32 USART1): converter TX -> PB7/RX,
 converter RX -> PA9/TX, common GND and compatible TTL logic levels.
 UART position transmission and the 1 ms motor service continue independently.

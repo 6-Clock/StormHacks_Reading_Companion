@@ -57,7 +57,8 @@ class SerialCommandSender:
             if request_id == self._last_request_id:
                 request_id = request_id % 0xFFFFFFFF + 1
             self._last_request_id = request_id
-            payload = f"{uart_command} {request_id}\n".encode("ascii")
+            # A bare newline could execute a buffered partial motion command.
+            payload = f"!\n{uart_command} {request_id}\n".encode("ascii")
             if self.connection is None:
                 print(f"[UART PREVIEW] {command!r} -> {payload!r}")
                 return False
@@ -70,14 +71,17 @@ class SerialCommandSender:
             acknowledged = False
             pending = bytearray()
             discard_line = False
-            while time.monotonic() < deadline:
+            while True:
                 self._check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 if not self.connection.is_open:
                     raise OSError("Serial connection closed; page-turn outcome is unknown")
+                self.connection.timeout = min(0.1, remaining)
                 chunk = self.connection.read(256)
                 self._check_cancelled()
-                if time.monotonic() >= deadline:
-                    break
+                # A timed read can return the final frame as the deadline expires.
                 for byte in chunk:
                     if byte != 10:
                         if not discard_line:
