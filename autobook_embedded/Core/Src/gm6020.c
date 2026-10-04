@@ -8,6 +8,9 @@ typedef struct {
     GM6020_Feedback feedback;
     bool seen, enabled, derivative_ready;
     float target, gain[3], integral, previous_error;
+    bool position_mode, position_derivative_ready;
+    uint16_t position_target;
+    float position_gain[3], position_integral, position_previous_error, max_rpm;
     float nm_per_raw;
     int16_t zero_raw;
     GM6020_ClampConfig clamp_config;
@@ -37,6 +40,9 @@ static void reset(Motor *m)
     m->integral = 0;
     m->previous_error = 0;
     m->derivative_ready = false;
+    m->position_integral = 0;
+    m->position_previous_error = 0;
+    m->position_derivative_ready = false;
 }
 HAL_StatusTypeDef GM6020_InitBus(uint8_t bus, CAN_HandleTypeDef *can, GM6020_Mode mode)
 {
@@ -84,13 +90,71 @@ bool set6020RPM(uint8_t bus, uint8_t id, float rpm, const float pid[3])
     }
     if (rpm == 0 && m->clamp_state == GM6020_CLAMP_RUNNING)
         m->clamp_state = GM6020_CLAMP_STOPPED;
-    if (m->target != rpm || memcmp(m->gain,pid,sizeof(m->gain)) != 0) reset(m);
+    if (m->position_mode || m->target != rpm || memcmp(m->gain,pid,sizeof(m->gain)) != 0) reset(m);
+    m->position_mode = false;
     m->target = rpm;
     memcpy(m->gain,pid,sizeof(m->gain));
     m->enabled = rpm != 0;
     if (!m->enabled) reset(m);
     taskEXIT_CRITICAL();
     return true;
+}
+bool set6020Pos(uint8_t bus, uint8_t id, uint16_t position,
+                const float positionPID[3], const float rpmPID[3], float maxRPM)
+{
+    if (!valid(bus,id) || position > 8191 || !positionPID || !rpmPID ||
+        !isfinite(maxRPM) || maxRPM <= 0 || maxRPM > 320) return false;
+    for (unsigned i=0;i<3;++i)
+        if (!isfinite(positionPID[i]) || positionPID[i] < 0 || positionPID[i] > 1000000.0f ||
+            !isfinite(rpmPID[i]) || rpmPID[i] < 0 || rpmPID[i] > 1000000.0f) return false;
+    taskENTER_CRITICAL();
+    Motor *m = &buses[bus-1].motor[id-1];
+    if (!buses[bus-1].can || m->clamp_state != GM6020_CLAMP_IDLE || !m->seen ||
+        (uint32_t)(HAL_GetTick()-m->feedback.timestamp_ms) >= GM6020_FEEDBACK_TIMEOUT_MS) {
+        taskEXIT_CRITICAL(); return false;
+    }
+    if (!m->position_mode || m->position_target != position || m->max_rpm != maxRPM ||
+        memcmp(m->position_gain,positionPID,sizeof(m->position_gain)) != 0 ||
+        memcmp(m->gain,rpmPID,sizeof(m->gain)) != 0) reset(m);
+    m->position_target = position;
+    m->max_rpm = maxRPM;
+    memcpy(m->position_gain,positionPID,sizeof(m->position_gain));
+    memcpy(m->gain,rpmPID,sizeof(m->gain));
+    m->position_mode = true;
+    m->enabled = true;
+    taskEXIT_CRITICAL();
+    return true;
+}
+/* Signed shortest error: (-4096,4096], including a positive half-turn tie. */
+static float position_error(uint16_t target, uint16_t current)
+{
+    int32_t error = (int32_t)target-current;
+    if (error > 4096) error -= 8192;
+    if (error <= -4096) error += 8192;
+    return (float)error;
+}
+static float position_speed(Motor *m, float dt)
+{
+    float error = position_error(m->position_target,m->feedback.position);
+    if (fabsf(error) <= 8.0f) {
+        m->position_integral = 0;
+        m->position_derivative_ready = false;
+        return 0;
+    }
+    float delta = error-m->position_previous_error;
+    /* Avoid a derivative spike at the half-turn shortest-path discontinuity. */
+    if (delta > 4096) delta -= 8192;
+    if (delta < -4096) delta += 8192;
+    float derivative = m->position_derivative_ready ? delta/dt : 0;
+    float next_i = clamp(m->position_integral+m->position_gain[1]*error*dt,m->max_rpm);
+    float pd = m->position_gain[0]*error+m->position_gain[2]*derivative;
+    float raw = pd+next_i;
+    if ((raw <= m->max_rpm && raw >= -m->max_rpm) ||
+        (raw > m->max_rpm && error < 0) || (raw < -m->max_rpm && error > 0))
+        m->position_integral = next_i;
+    m->position_previous_error = error;
+    m->position_derivative_ready = true;
+    return clamp(pd+m->position_integral,m->max_rpm);
 }
 bool stop6020(uint8_t bus, uint8_t id)
 {
@@ -164,6 +228,7 @@ bool start6020Clamp(uint8_t bus, uint8_t id, float rpm, const float pid[3],
     uint16_t magnitude = (uint16_t)(current < 0 ? -current : current);
     if (magnitude >= config->threshold_raw) { taskEXIT_CRITICAL(); return false; }
     reset(m);
+    m->position_mode = false;
     m->target = rpm;
     memcpy(m->gain,pid,sizeof(m->gain));
     m->clamp_config = *config;
@@ -256,7 +321,8 @@ void GM6020_Service(void)
                 m->clamp_config.command_limit : limit;
             if (timely && m->enabled && m->seen &&
                 (uint32_t)(now-m->feedback.timestamp_ms) < GM6020_FEEDBACK_TIMEOUT_MS) {
-                float error = m->target-m->feedback.rpm;
+                float target_rpm = m->position_mode ? position_speed(m,dt) : m->target;
+                float error = target_rpm-m->feedback.rpm;
                 float derivative = m->derivative_ready ? (error-m->previous_error)/dt : 0;
                 float next_i = clamp(m->integral+m->gain[1]*error*dt,motor_limit);
                 float pd = m->gain[0]*error+m->gain[2]*derivative;

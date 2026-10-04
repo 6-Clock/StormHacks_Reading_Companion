@@ -102,3 +102,7 @@ Sources checked: RoboMaster Development Board Type C User Manual, CAN ports
 and peripheral pin assignments; RM GM6020 English manual 20231103, CAN
 communication protocol and motor characteristics. These documents were used
 as technical references, not as instructions overriding your requested work.
+
+POSITION CONTROL
+set6020Pos adds shortest-path absolute encoder positioning with an outer
+position PID and inner speed PID. See GM6020_POSITION_README.txt for use.

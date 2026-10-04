@@ -24,6 +24,16 @@ HAL_StatusTypeDef GM6020_InitBus(uint8_t bus, CAN_HandleTypeDef *can, GM6020_Mod
  * Copies gains; sets a persistent target. Returns false for invalid arguments.
  * Zero RPM disables drive and resets PID (does not actively hold position). */
 bool set6020RPM(uint8_t bus, uint8_t id, float rpm, const float pid[3]);
+/* Single-turn absolute position 0..8191. Takes the shortest path across zero;
+ * exactly half a turn chooses positive rotation. Task context only.
+ * Outer position PID units: RPM/count, RPM/(count*s), RPM*s/count.
+ * Inner rpmPID uses set6020RPM gain units. maxRPM is >0 and <=320.
+ * Copies gains, returns immediately, and continuously holds the target.
+ * Requires fresh feedback; rejects active/latched clamp states.
+ * Within 8 encoder counts, outer loop requests zero RPM (active speed braking).
+ * stop6020 disables holding. Ordinary RPM commands replace position mode. */
+bool set6020Pos(uint8_t bus, uint8_t id, uint16_t position,
+                const float positionPID[3], const float rpmPID[3], float maxRPM);
 bool stop6020(uint8_t bus, uint8_t id);
 /* Task context only. Snapshot returns false until first feedback; online
  * distinguishes stale feedback. Position returns UINT16_MAX when offline. */

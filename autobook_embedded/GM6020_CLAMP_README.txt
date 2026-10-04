@@ -1,10 +1,10 @@
 GM6020 BOOK CLAMP: CURRENT FEEDBACK AND CONTACT STOP
 
 Implemented in Core/Inc/gm6020.h and Core/Src/gm6020.c.
-MainTask starts once on boot on CAN1 motor 2 at -50 RPM. Each debounced
-PA0 press rearms another run with the opposite direction: +50, -50, +50...
-Your settings are retained: PID {40, 0.01, 0}, raw-current threshold 2000,
-5 ms confirmation, 5 second timeout, voltage command limit 10000.
+MainTask starts once on boot on CAN1 motor 2 at -60 RPM. Each debounced
+PA0 press rearms another run with the opposite direction: +60, -60, +60...
+Your settings are retained: PID {55, 0.01, 0}, raw-current threshold 2500,
+5 ms confirmation, 3 second timeout, voltage command limit 10000.
 PA0 is configured as an input with pull-up. Connect the button to GND:
 LOW is pressed. Press and release each require 30 ms of stable input.
 Holding the button, including through startup, does not cause repeated starts.
@@ -121,3 +121,14 @@ limit, latched restart rejection, explicit rearm, closure timeout, lost feedback
 delayed service, bus 2, int16 minimum, fresh-frame confirmation and tick wrap.
 Complete STM32F407 firmware compiled and linked against the actual HAL and
 FreeRTOS sources. Hardware calibration and book-clamping tests remain to do.
+
+MAIN.C CLAMP HELPER
+RunBookClamp(float closingRPM) is a static nonblocking helper outside MainTask.
+Example: RunBookClamp(-60.0f). It uses CAN1 motor 2, PID {55,0.01,0},
+raw threshold 2500, confirm 5 ms, timeout 3000 ms, and command limit 10000.
+It calls start6020Clamp once and updates debugger start/target state.
+LibraryHandler continues RPM regulation until a threshold/fault stop occurs.
+Do not call RunBookClamp continuously: each successful call rearms the guard.
+UpdateBookClampStatus refreshes debugger feedback; WaitForBookClampFeedback
+handles the initial bounded wait. Button state, debounce, and nextRPM toggle
+remain entirely in MainTask. These helpers are local to main.c.

@@ -18,6 +18,11 @@ static void load(CAN_HandleTypeDef *c,unsigned id,int current){
 CAN_RxHeaderTypeDef h={0};h.StdId=0x204+id;h.DLC=8;
 uint16_t bits=(uint16_t)current;uint8_t d[8]={0,0,0,0,(uint8_t)(bits>>8),(uint8_t)bits,30,0};GM6020_OnRx(c,&h,d);
 }
+static void pose(CAN_HandleTypeDef *c,unsigned id,unsigned position,int rpm){
+CAN_RxHeaderTypeDef h={0};h.StdId=0x204+id;h.DLC=8;uint16_t r=(uint16_t)rpm;
+uint8_t d[8]={(uint8_t)(position>>8),(uint8_t)position,(uint8_t)(r>>8),(uint8_t)r,0,0,30,0};GM6020_OnRx(c,&h,d);
+}
+static int command(unsigned frame,unsigned slot){unsigned v=((unsigned)tx[frame].data[slot*2]<<8)|tx[frame].data[slot*2+1];return v>=32768?(int)v-65536:(int)v;}
 int main(void){CAN_HandleTypeDef c1={CAN1},c2={CAN2};float pid[3]={100,0,0};GM6020_Feedback f;
 assert(get6020Pos(1,1)==UINT16_MAX);assert(!set6020RPM(1,1,10,pid));
 assert(GM6020_InitBus(1,&c1,GM6020_VOLTAGE)==HAL_OK);assert(GM6020_InitBus(2,&c2,GM6020_CURRENT)==HAL_OK);
@@ -73,5 +78,43 @@ assert(stop6020(1,2));assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP
 now=UINT32_MAX-2;load(&c1,2,0);assert(start6020Clamp(1,2,10,pid,&cfg));
 load(&c1,2,1500);now=UINT32_MAX;load(&c1,2,1500);now=0;load(&c1,2,1500);
 assert(get6020ClampStatus(1,2,&cs)&&cs.state==GM6020_CLAMP_CONTACT);
+/* Position control validation, shortest wrap path, speed cap and mode transitions. */
+float pos_pid[3]={1,0,0},speed_pid[3]={10,0,0};
+assert(!set6020Pos(1,3,100,pos_pid,speed_pid,50)); /* no feedback */
+now=1000;pose(&c1,3,8190,0);step(1000);
+assert(!set6020Pos(1,3,8192,pos_pid,speed_pid,50));
+assert(!set6020Pos(1,3,100,NULL,speed_pid,50));
+assert(!set6020Pos(1,3,100,pos_pid,speed_pid,NAN));
+assert(!set6020Pos(1,3,100,pos_pid,speed_pid,0));
+assert(!set6020Pos(1,3,100,pos_pid,speed_pid,321));
+assert(!set6020Pos(1,2,100,pos_pid,speed_pid,50)); /* clamp latch */
+assert(set6020Pos(1,3,20,pos_pid,speed_pid,50));step(1001);assert(command(0,2)==220);
+now=1002;pose(&c1,3,2,0);assert(set6020Pos(1,3,8172,pos_pid,speed_pid,50));step(1002);assert(command(0,2)==-220);
+now=1003;pose(&c1,3,0,0);assert(set6020Pos(1,3,4096,pos_pid,speed_pid,50));step(1003);assert(command(0,2)==500);
+now=1004;pose(&c1,3,4096,0);assert(set6020Pos(1,3,0,pos_pid,speed_pid,50));step(1004);assert(command(0,2)==500); /* half-turn tie */
+now=1005;pose(&c1,3,100,0);assert(set6020Pos(1,3,100,pos_pid,speed_pid,50));step(1005);assert(command(0,2)==0);
+now=1006;pose(&c1,3,100,10);step(1006);assert(command(0,2)==-100); /* speed braking at target */
+now=1007;pose(&c1,3,150,0);step(1007);assert(command(0,2)==-500); /* disturbance correction */
+assert(stop6020(1,3));step(1008);assert(command(0,2)==0);
+assert(set6020Pos(1,3,200,pos_pid,speed_pid,50));assert(set6020RPM(1,3,-10,speed_pid));step(1009);assert(command(0,2)==-100);
+/* Identical repeated position commands preserve integral; stop and new mode reset it. */
+float pos_pi[3]={0,100,0};now=1010;pose(&c1,3,0,0);
+assert(set6020Pos(1,3,20,pos_pi,speed_pid,50));step(1010);assert(command(0,2)==20);
+assert(set6020Pos(1,3,20,pos_pi,speed_pid,50));step(1011);assert(command(0,2)==40);
+/* Outer anti-windup: prolonged large error then reduce to 10 counts. */
+float pos_sat[3]={100,100,0};assert(set6020Pos(1,3,200,pos_sat,speed_pid,50));
+for(unsigned t=1012;t<=1050;++t){now=t;pose(&c1,3,0,0);step(t);}
+float pos_test[3]={1,100,0};assert(set6020Pos(1,3,200,pos_test,speed_pid,50));
+for(unsigned t=1051;t<=1090;++t){now=t;pose(&c1,3,0,0);step(t);}
+now=1091;pose(&c1,3,190,0);step(1091);assert(command(0,2)==110); /* 10 + 1 RPM integral, no windup */
+for(unsigned t=1092;t<=1191;++t){step(t);}assert(command(0,2)==0); /* stale zero */
+assert(!set6020Pos(1,3,200,pos_pid,speed_pid,50));
+now=1192;pose(&c1,3,190,0);step(1192);assert(command(0,2)==110); /* recovery resets history */
+/* Current-mode second bus also runs position controller. */
+now=1193;pose(&c2,6,0,0);assert(set6020Pos(2,6,100,pos_pid,speed_pid,20));step(1193);assert(command(3,1)==200);
+/* A guarded clamp replaces position control. */
+GM6020_ClampConfig position_clamp={1000,3,500,1000};
+assert(start6020Clamp(1,3,-10,speed_pid,&position_clamp));step(1194);assert(command(0,2)==-100);
+puts("PASS: position shortest path, half-turn ties, speed cap, target braking, holding, mode switching, input checks, latch, repeated calls, anti-windup, stale feedback, bus 2");
 puts("PASS: torque calibration, debounce, peak tracking, latching, command limit, explicit rearm, timeout, stale feedback, service gap, int16 minimum, fresh-frame debounce, tick wrap");
 puts("PASS: protocol, signed feedback, bus isolation, validation, limits, stop, timeout, mailbox pressure, delayed service, anti-windup");}

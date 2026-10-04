@@ -81,6 +81,9 @@ void StartLibraryHandler(void *argument);
 void StartMainTask(void *argument);
 
 /* USER CODE BEGIN PFP */
+static bool WaitForBookClampFeedback(uint32_t timeoutMs);
+static bool RunBookClamp(float closingRPM);
+static void UpdateBookClampStatus(void);
 
 /* USER CODE END PFP */
 
@@ -288,6 +291,77 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* Book clamp helpers: no button handling or direction toggling here. */
+static bool WaitForBookClampFeedback(uint32_t timeoutMs)
+{
+  GM6020_Feedback feedback;
+  const uint32_t started = HAL_GetTick();
+  while ((uint32_t)(HAL_GetTick() - started) < timeoutMs)
+  {
+    if (get6020Feedback(1, 2, &feedback) && feedback.online)
+    {
+      clampExampleCurrentRaw = feedback.current_raw;
+      return true;
+    }
+    osDelay(5);
+  }
+  (void)stop6020(1, 2);
+  clampExampleState = GM6020_CLAMP_FEEDBACK_LOST;
+  clampExampleFinished = true;
+  return false;
+}
+
+/* Call once for each intended run, not continuously in the polling loop.
+ * Copies the chosen RPM/PID into the library's asynchronous guarded control.
+ * LibraryHandler stops on sustained load, timeout, lost feedback or late service.
+ * Tune the raw-current threshold/command limit by feel; no N*m calibration. */
+static bool RunBookClamp(float closingRPM)
+{
+  const float pid[3] = {55.0f, 0.01f, 0.0f};
+  const GM6020_ClampConfig config = {
+    .threshold_raw = 2500,
+    .confirm_ms = 5,
+    .max_run_ms = 3000,   /* 3-second closure limit. */
+    .command_limit = 10000
+  };
+  const bool started = start6020Clamp(1, 2, closingRPM, pid, &config);
+  clampExampleStartRejected = !started;
+  if (started)
+  {
+    clampExampleStarted = true;
+    clampExampleFinished = false;
+    clampExampleState = GM6020_CLAMP_RUNNING;
+    clampExamplePeakRaw = 0;
+    clampExampleTargetRPM = closingRPM;
+  }
+  else if (!clampExampleStarted)
+  {
+    (void)stop6020(1, 2);
+    clampExampleState = GM6020_CLAMP_STOPPED;
+    clampExampleFinished = true;
+  }
+  /* A rejected restart preserves the previous run/stop and its debug state. */
+  return started;
+}
+
+static void UpdateBookClampStatus(void)
+{
+  GM6020_Feedback feedback;
+  if (get6020Feedback(1, 2, &feedback) && feedback.online)
+    clampExampleCurrentRaw = feedback.current_raw;
+  if (clampExampleStarted)
+  {
+    GM6020_ClampStatus status;
+    if (get6020ClampStatus(1, 2, &status))
+    {
+      clampExampleState = status.state;
+      clampExamplePeakRaw = status.peak_current_raw;
+      clampExampleFinished = status.state != GM6020_CLAMP_RUNNING;
+    }
+  }
+}
+
+
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
 {
   CAN_RxHeaderTypeDef header;
@@ -332,61 +406,13 @@ void StartMainTask(void *argument)
 {
   /* USER CODE BEGIN StartMainTask */
   (void)argument;
+  float nextRPM = -60.0f;
 
-  const uint8_t bus = 1;
-  const uint8_t motor = 2;
-  const float closingRPM = -60.0f;
-  const float pid[3] = {45.0f, 0.01f, 0.0f};
-  const GM6020_ClampConfig config = {
-    .threshold_raw = 1000, /* Lower = more sensitive to motor load. */
-    .confirm_ms = 5,       /* Reject brief spikes; longer delays the stop. */
-    .max_run_ms = 3000,    /* Stop if contact is not detected within 5 s. */
-    .command_limit = 10000  /* Voltage command cap; lower = weaker drive. */
-  };
+  /* Start once on boot. Direction changes only after an accepted run. */
+  if (WaitForBookClampFeedback(2000U) && RunBookClamp(nextRPM))
+    nextRPM = -nextRPM;
 
-  /* Wait at most 2 seconds for fresh CAN feedback before starting. */
-  GM6020_Feedback feedback;
-  const uint32_t waitStarted = HAL_GetTick();
-  bool ready = false;
-  while ((uint32_t)(HAL_GetTick() - waitStarted) < 2000U)
-  {
-    if (get6020Feedback(bus, motor, &feedback) && feedback.online)
-    {
-      ready = true;
-      break;
-    }
-    osDelay(5);
-  }
-
-  /* Initial run on boot; subsequent runs are triggered by PA0 presses. */
-  float nextRPM = closingRPM;
-  if (ready)
-  {
-    clampExampleCurrentRaw = feedback.current_raw;
-    clampExampleStarted = start6020Clamp(bus, motor, closingRPM, pid, &config);
-    clampExampleStartRejected = !clampExampleStarted;
-    if (clampExampleStarted)
-    {
-      clampExampleTargetRPM = nextRPM;
-      nextRPM = -nextRPM;
-    }
-    if (!clampExampleStarted)
-    {
-      (void)stop6020(bus, motor);
-      clampExampleState = GM6020_CLAMP_STOPPED;
-      clampExampleFinished = true;
-    }
-  }
-  else
-  {
-    (void)stop6020(bus, motor);
-    clampExampleState = GM6020_CLAMP_FEEDBACK_LOST;
-    clampExampleFinished = true;
-  }
-
-  /* PA0 has a pull-up: pressing a button wired to GND reads RESET.
-   * Initialize from the actual level so a held button does not trigger.
-   * Both press and release must remain stable for 30 ms. */
+  /* PA0 pull-up: LOW is pressed. Ignore a button held during startup. */
   bool buttonSample = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
   bool buttonStable = buttonSample;
   uint32_t buttonChangedMs = HAL_GetTick();
@@ -403,45 +429,12 @@ void StartMainTask(void *argument)
     if (buttonSample != buttonStable && (uint32_t)(now - buttonChangedMs) >= 30U)
     {
       buttonStable = buttonSample;
-      if (buttonStable)
-      {
-        /* Exactly one rearm per press. Reverse only on a successful start.
-         * A press during a run restarts it with the opposite target. */
-        const bool started = start6020Clamp(bus, motor, nextRPM, pid, &config);
-        clampExampleStartRejected = !started;
-        if (started)
-        {
-          clampExampleStarted = true;
-          clampExampleFinished = false;
-          clampExampleState = GM6020_CLAMP_RUNNING;
-          clampExamplePeakRaw = 0;
-          clampExampleTargetRPM = nextRPM;
-          nextRPM = -nextRPM;
-        }
-        /* Rejected starts leave the existing run/stop and next direction intact. */
-      }
+      /* One rearm per press; rejected starts leave the next direction intact. */
+      if (buttonStable && RunBookClamp(nextRPM))
+        nextRPM = -nextRPM;
     }
 
-    if (get6020Feedback(bus, motor, &feedback) && feedback.online)
-      clampExampleCurrentRaw = feedback.current_raw;
-
-    if (clampExampleStarted)
-    {
-      GM6020_ClampStatus status;
-      if (get6020ClampStatus(bus, motor, &status))
-      {
-        clampExampleState = status.state;
-        clampExamplePeakRaw = status.peak_current_raw;
-        if (status.state != GM6020_CLAMP_RUNNING)
-          clampExampleFinished = true;
-      }
-    }
-
-    /* LibraryHandler performs the actual load check and zero-output command.
-     * CONTACT = successful contact; other terminal states indicate a fault
-     * or manual stop. Zero output does not actively hold the book.
-     * Press/release PA0 to rearm in alternating directions. A held button
-     * cannot repeatedly rearm. Rejected starts require another press. */
+    UpdateBookClampStatus();
     osDelay(5);
   }
   /* USER CODE END StartMainTask */
