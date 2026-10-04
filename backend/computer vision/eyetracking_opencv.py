@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_DIR / "venv" / "Lib" / "site-packages"))
 
 import cv2  # noqa: E402
 import mediapipe as mp  # noqa: E402
+import numpy as np  # noqa: E402
 import serial  # noqa: E402
 from blink_detector import (  # noqa: E402
     BLINK_SENSITIVITY,
@@ -26,6 +27,7 @@ from blink_detector import (  # noqa: E402
 )
 from read_mode_state import ReadModeController  # noqa: E402
 
+from app.services.camera_lease import CameraLease  # noqa: E402
 from app.services.eye_publisher import EyeTelemetryPublisher  # noqa: E402
 from app.services.tracker_control import TrackerControlClient  # noqa: E402
 
@@ -44,40 +46,132 @@ RIGHT_EYE = {"outer": 263, "inner": 362, "top": 386, "bottom": 374, "iris": 473}
 
 
 class LatestFrameReader:
-    """Continuously drain the webcam and expose only its newest frame."""
+    """Own camera I/O in one thread and release its lease only after that thread exits."""
 
-    def __init__(self, capture: cv2.VideoCapture) -> None:
-        self._capture = capture
+    def __init__(self, camera_index: int, width: int, height: int, fps: int) -> None:
+        self._camera_index = camera_index
+        self._width, self._height, self._fps = width, height, fps
+        self._lease = CameraLease()
+        self._lease_held = False
+        self._release_finished = True
         self._lock = threading.Lock()
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
         self._latest: tuple[int, float, float, object] | None = None
+        self._state = "released"
+        self.last_error: str | None = None
         self._frame_id = 0
         self.capture_fps = 0.0
         self.read_failures = 0
         self._last_capture_at: float | None = None
 
-    def start(self) -> None:
+    @property
+    def state(self) -> str:
+        self._reap()
+        with self._lock:
+            return self._state
+
+    def _reap(self) -> None:
+        """Main-thread only: a stopped reader can no longer touch the camera."""
+        if self._thread is None or self._thread.is_alive():
+            return
+        self._thread.join(timeout=0)
+        if self._lease_held and self._release_finished:
+            self._lease.release()
+            self._lease_held = False
+        self._thread = None
+        with self._lock:
+            self._latest = None
+            self._state = "error" if self.last_error else "released"
+
+    def start(self) -> bool:
+        self._reap()
+        if self._thread is not None or self._lease_held:
+            return False
+        try:
+            if not self._lease.acquire():
+                return False
+        except OSError as error:
+            self.last_error = f"Camera ownership could not be acquired: {error}"
+            self._state = "error"
+            return False
+        self._lease_held = True
+        self._release_finished = False
+        self.last_error = None
+        self._last_capture_at = None
+        self.capture_fps = 0.0
+        with self._lock:
+            self._state = "opening"
+            self._latest = None
         self._running.set()
-        self._thread = threading.Thread(target=self._read_forever, daemon=True, name="camera-reader")
-        self._thread.start()
+        self._thread = threading.Thread(
+            target=self._read_forever, daemon=True, name="camera-reader",
+        )
+        try:
+            self._thread.start()
+        except RuntimeError as error:
+            self._thread = None
+            self._running.clear()
+            self._release_finished = True
+            self._lease.release()
+            self._lease_held = False
+            self.last_error = f"Eye camera worker could not start: {error}"
+            self._state = "error"
+            return False
+        return True
 
     def _read_forever(self) -> None:
-        while self._running.is_set():
-            ok, frame = self._capture.read()
-            captured_at = time.monotonic()
-            captured_epoch = time.time()
-            if not ok:
-                self.read_failures += 1
-                time.sleep(0.01)
-                continue
+        capture = None
+        try:
+            if not self._running.is_set():
+                return
+            capture = (
+                cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
+                if sys.platform == "win32" else cv2.VideoCapture(self._camera_index)
+            )
+            if not capture.isOpened():
+                raise RuntimeError(f"Eye camera {self._camera_index} could not be opened.")
+            if not self._running.is_set():
+                return
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            capture.set(cv2.CAP_PROP_FPS, self._fps)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             with self._lock:
-                if self._last_capture_at is not None:
-                    instant_fps = 1.0 / max(captured_at - self._last_capture_at, 1e-6)
-                    self.capture_fps = instant_fps if self.capture_fps == 0.0 else self.capture_fps * 0.85 + instant_fps * 0.15
-                self._last_capture_at = captured_at
-                self._frame_id += 1
-                self._latest = (self._frame_id, captured_at, captured_epoch, frame)
+                self._state = "open" if self._running.is_set() else "closing"
+            while self._running.is_set():
+                ok, frame = capture.read()
+                captured_at = time.monotonic()
+                captured_epoch = time.time()
+                if not self._running.is_set():
+                    break
+                if not ok:
+                    self.read_failures += 1
+                    time.sleep(0.01)
+                    continue
+                with self._lock:
+                    if self._last_capture_at is not None:
+                        instant_fps = 1.0 / max(captured_at - self._last_capture_at, 1e-6)
+                        self.capture_fps = (
+                            instant_fps if self.capture_fps == 0.0
+                            else self.capture_fps * 0.85 + instant_fps * 0.15
+                        )
+                    self._last_capture_at = captured_at
+                    self._frame_id += 1
+                    self._latest = (self._frame_id, captured_at, captured_epoch, frame)
+        except (cv2.error, RuntimeError, OSError) as error:
+            self.last_error = str(error)
+        finally:
+            with self._lock:
+                self._state = "closing"
+                self._latest = None
+            try:
+                if capture is not None:
+                    capture.release()
+                self._release_finished = True
+            except (cv2.error, RuntimeError, OSError) as error:
+                self.last_error = f"Eye camera release failed; restart the tracker: {error}"
+            self._running.clear()
 
     def newest(self) -> tuple[int, float, float, object] | None:
         with self._lock:
@@ -86,11 +180,23 @@ class LatestFrameReader:
             frame_id, captured_at, captured_epoch, frame = self._latest
             return frame_id, captured_at, captured_epoch, frame.copy()
 
-    def close(self) -> None:
+    def request_stop(self) -> None:
         self._running.clear()
+        with self._lock:
+            self._latest = None
+            if self._thread is not None:
+                self._state = "closing"
+            elif not self._lease_held:
+                self._state = "released"
+
+    def close(self) -> None:
+        self.request_stop()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        self._capture.release()
+        # If read/release is wedged, retain ownership until process exit. OCR
+        # must never open its camera beside a reader still using the hardware.
+        self._reap()
+        self.request_stop()
 
 
 class SerialCommandSender:
@@ -229,18 +335,8 @@ def main() -> int:
     if not 8 <= args.ocr_settle_seconds <= 30:
         parser.error("--ocr-settle-seconds must be between 8 and 30.")
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print(f"Camera index {args.camera} could not be opened. Try --camera 0 for the laptop camera.")
-        return 1
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    reader = LatestFrameReader(cap)
-    reader.start()
+    # Wait for fresh API permission and the cross-process lease before opening.
+    reader = LatestFrameReader(args.camera, args.width, args.height, args.fps)
 
     try:
         command_sender = SerialCommandSender(args.port, args.baud)
@@ -287,10 +383,86 @@ def main() -> int:
     telemetry.event("tracker", tracker_message)
     previous_mode = None
     previous_control_revision = None
+    camera_pause_active = False
+    next_camera_attempt = 0.0
+    reported_camera_error = None
+    idle_canvas = np.zeros((480, 640, 3), dtype=np.uint8)
     controls.start()
 
     try:
         while True:
+            control_state = controls.snapshot()
+            if (
+                controller.blink_only != control_state.blink_only
+                or previous_control_revision != control_state.revision
+            ):
+                controller.set_blink_only(control_state.blink_only, force=True)
+                previous_control_revision = control_state.revision
+                telemetry.event(
+                    "mode",
+                    "Blink-only test mode enabled" if control_state.blink_only
+                    else "Gaze hold required; fresh reading gesture required",
+                )
+            camera_state = reader.state
+            if control_state.should_pause:
+                if not camera_pause_active:
+                    camera_pause_active = True
+                    controller.reset()
+                    pending_commands.clear()
+                    blink_detector.observe(time.monotonic(), 0, 0, eyes_visible=False)
+                    blink_flash_until = 0.0
+                    last_blink_count = 0
+                    telemetry.event("tracker", "Releasing eye camera for book scanning.")
+                reader.request_stop()
+            elif (
+                camera_state in {"released", "error"} and control_state.can_open_camera
+                and time.monotonic() >= next_camera_attempt
+            ):
+                reader.start()
+                next_camera_attempt = time.monotonic() + 2.0
+            camera_state = reader.state
+            if camera_state == "open" and camera_pause_active and not control_state.should_pause:
+                camera_pause_active = False
+                controller.reset()
+                controller.update(
+                    time.monotonic(), eyes_visible=False, eyes_open=False,
+                    looking_at_camera=False, turns_blocked=True,
+                )
+                blink_detector.observe(time.monotonic(), 0, 0, eyes_visible=False)
+                telemetry.event("tracker", "Eye camera reopened; fresh blinks are required.")
+            if reader.last_error and reader.last_error != reported_camera_error:
+                reported_camera_error = reader.last_error
+                print(f"[EYE CAMERA] {reader.last_error}", flush=True)
+                telemetry.event("tracker", reader.last_error)
+            controls.applied(
+                control_state.revision, controller.blink_only, eye_camera_state=camera_state,
+            )
+            for event_type, message in controls.drain_events():
+                telemetry.event(event_type, message)
+            if camera_state != "open" or control_state.should_pause:
+                controller.update(
+                    time.monotonic(), eyes_visible=False, eyes_open=False,
+                    looking_at_camera=False, turns_blocked=True,
+                )
+                display = idle_canvas.copy()
+                text(display, 0, "LOOB eye camera", (170, 210, 170))
+                if control_state.should_pause:
+                    text(display, 2, "Eye camera paused for book scanning")
+                    text(display, 3, f"Camera state: {camera_state}")
+                    text(display, 4, "Eye tracking resumes after the scan finishes.")
+                elif not control_state.connected:
+                    text(display, 2, "Waiting for the local API before opening camera")
+                elif camera_state == "error":
+                    text(display, 2, "Eye camera unavailable; checking again shortly")
+                    text(display, 3, "Check the camera index and close other camera apps.")
+                else:
+                    text(display, 2, f"Eye camera: {camera_state}")
+                    text(display, 3, "Waiting for camera ownership or initialization")
+                text(display, 8, "Q/ESC=quit")
+                cv2.imshow("OpenCV + MediaPipe Read Controller", display)
+                if cv2.waitKey(30) & 0xFF in (ord("q"), 27):
+                    break
+                continue
             newest = reader.newest()
             if newest is None or newest[0] == previous_frame_id:
                 key = cv2.waitKey(1) & 0xFF
@@ -346,19 +518,9 @@ def main() -> int:
                     "calibration",
                     f"Eye baseline calibrated from {eye_reading.sample_count} samples",
                 )
+            # A pause may have arrived during landmark inference. Discard this
+            # gesture and let the next loop close the camera before OCR proceeds.
             control_state = controls.snapshot()
-            if (
-                controller.blink_only != control_state.blink_only
-                or previous_control_revision != control_state.revision
-            ):
-                controller.set_blink_only(control_state.blink_only, force=True)
-                previous_control_revision = control_state.revision
-                telemetry.event(
-                    "mode",
-                    "Blink-only test mode enabled" if control_state.blink_only
-                    else "Gaze hold required; fresh reading gesture required",
-                )
-            controls.applied(control_state.revision, controller.blink_only)
             snapshot = controller.update(
                 now,
                 eyes_visible=eyes_visible,
@@ -382,8 +544,6 @@ def main() -> int:
                     telemetry.event(
                         "command", "Page turn skipped while scanner or tracker controls busy",
                     )
-            for event_type, message in controls.drain_events():
-                telemetry.event(event_type, message)
             if snapshot.display_mode != previous_mode:
                 telemetry.event("mode", f"Mode changed to {snapshot.display_mode}")
                 previous_mode = snapshot.display_mode
@@ -451,10 +611,31 @@ def main() -> int:
                     "calibration", "Eye calibration started; hold eyes open for one second",
                 )
     finally:
+        controls.begin_shutdown()
+        reader.close()
+        release_deadline = time.monotonic() + 8.0
+        while reader.state in {"opening", "open", "closing"}:
+            control_state = controls.snapshot()
+            controller.set_blink_only(control_state.blink_only)
+            controls.applied(
+                control_state.revision, controller.blink_only, eye_camera_state=reader.state,
+            )
+            if time.monotonic() >= release_deadline:
+                print(
+                    "[EYE CAMERA] Camera release is still blocked. After this tracker exits, "
+                    "restart the API before scanning again.", flush=True,
+                )
+                break
+            time.sleep(0.05)
+        reader.request_stop()
+        control_state = controls.snapshot()
+        controller.set_blink_only(control_state.blink_only)
+        controls.applied(
+            control_state.revision, controller.blink_only, eye_camera_state=reader.state,
+        )
         telemetry.close()
         controls.close()
         face_mesh.close()
-        reader.close()
         cv2.destroyAllWindows()
         command_sender.close()
         if diagnostic_file is not None:

@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -643,10 +644,16 @@ def flip_page() -> None:
 
 
 def open_camera(camera_index: int) -> cv2.VideoCapture:
-    """Open a Windows camera quickly, then fall back to OpenCV's default backend."""
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap.release()
+    """Use DirectShow on Windows; its default backend can hang during opening."""
+    if sys.platform == "win32":
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(
+                f"Windows DirectShow could not open camera {camera_index}. "
+                "Close other camera apps or check the selected camera index."
+            )
+    else:
         cap = cv2.VideoCapture(camera_index)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -681,15 +688,31 @@ def main() -> int:
     if not args.local_ocr and (not openai_api_key or not openai_model):
         parser.error("AI OCR requires OPENAI_API_KEY and OPENAI_OCR_MODEL, OPENAI_MODEL, or --openai-model.")
 
-    print(f"Opening camera index {args.camera}...")
-    cap = open_camera(args.camera)
-    if not cap.isOpened():
-        print(f"Camera {args.camera} could not be opened. Close other camera apps and try --camera 0.")
-        return 1
+    # The web worker already holds this lease. Only the standalone entry point
+    # acquires here, so its camera cannot overlap the native eye tracker either.
+    if str(BACKEND_DIR) not in sys.path:
+        sys.path.insert(0, str(BACKEND_DIR))
+    from app.services.camera_lease import CameraLease
 
-    print(f"Camera {args.camera} opened.")
-    print("Press f to flip + scan, c to scan, or q to quit.")
+    lease = CameraLease()
+    if not lease.acquire():
+        print(
+            "Another LOOB camera is active. Stop it first, or use Developer's "
+            "Live camera for automatic handoff."
+        )
+        return 1
+    cap = None
     try:
+        print(f"Opening camera index {args.camera}...")
+        cap = open_camera(args.camera)
+        if not cap.isOpened():
+            print(
+                f"Camera {args.camera} could not be opened. "
+                "Check its index and close other camera apps."
+            )
+            return 1
+        print(f"Camera {args.camera} opened.")
+        print("Press f to flip + scan, c to scan, or q to quit.")
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -725,7 +748,9 @@ def main() -> int:
                     capture_best_frames(cap), None if args.local_ocr else openai_api_key, openai_model, openai_revision_model
                 )
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
+        lease.release()
         cv2.destroyAllWindows()
     return 0
 

@@ -49,6 +49,8 @@ return (async () => {
       fixture.job = {job_id:`scan-${++fixture.sequence}`, trigger_id:request.trigger_id, source:request.source, camera_index:request.camera_index, status:'framing', message:'Frame the page', events:[]};
       fixture.jobs[fixture.job.job_id] = fixture.job;
       body = fixture.job;
+    } else if (path.endsWith('/preview')) {
+      body = {...fixture.job, frame:null};
     } else if (path.endsWith('/capture')) {
       fixture.job.status = 'transcribing'; fixture.job.message = 'Reading text'; body = fixture.job;
     } else if (path.endsWith('/cancel')) {

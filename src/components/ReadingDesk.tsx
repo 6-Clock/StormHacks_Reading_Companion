@@ -407,7 +407,8 @@ export function ReadingDesk() {
 
   async function testThreeBlinks() {
     if (scanControlWorking.current || scanning || blinkTestCount !== null || busy || recording) return;
-    const eyeCameraIndex = tracker.data?.eye_camera_index ?? diagnostics.data?.camera_index ?? 1;
+    const eyeCameraIndex = tracker.data?.tracker_connected ? tracker.data.eye_camera_index ?? undefined
+      : diagnostics.data?.connected ? diagnostics.data.camera_index ?? undefined : undefined;
     if (eyeCameraIndex === cameraIndex) {
       add({ role: "error", text: "Choose different camera indexes for eye tracking and OCR first." });
       return;
@@ -572,7 +573,7 @@ export function ReadingDesk() {
         </div>
 
         <div id="developer-panel" className="notebook-spread" role="region" aria-label="Developer" hidden={tab !== "developer"}>
-          <DeveloperPanel diagnostics={diagnostics} tracker={tracker} lastScan={lastScan} scanJob={scans.job} scanConnected={scans.connected} scanError={scans.error} scanAction={scans.action} scanDisabled={controlsBusy || recording || scanning || !scans.connected || blinkTestCount !== null} blinkTestCount={blinkTestCount} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} onCapture={() => void controlScan("capture")} onCancel={() => void controlScan("cancel")} onTestThreeBlinks={() => void testThreeBlinks()} events={events}>
+          <DeveloperPanel visible={tab === "developer"} diagnostics={diagnostics} tracker={tracker} lastScan={lastScan} scanJob={scans.job} scanConnected={scans.connected} scanError={scans.error} scanAction={scans.action} scanDisabled={controlsBusy || recording || scanning || !scans.connected || blinkTestCount !== null} blinkTestCount={blinkTestCount} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} onCapture={() => void controlScan("capture")} onCancel={() => void controlScan("cancel")} onTestThreeBlinks={() => void testThreeBlinks()} events={events}>
             <section className="reader-tools" aria-labelledby="reader-tools-heading">
               <h3 id="reader-tools-heading">Reader controls</h3>
               <div className="narration-actions">

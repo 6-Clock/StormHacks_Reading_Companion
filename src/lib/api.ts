@@ -45,7 +45,7 @@ export type CameraScan = {
   openai_revision_status: "not_requested" | "skipped_high_confidence" | "requested";
 };
 
-export type ScanStatus = "idle" | "reserved" | "queued" | "settling" | "opening_camera" | "framing" | "capturing" | "transcribing" | "reviewing" | "preview" | "cancelling" | "accepted" | "rejected" | "unchanged" | "cancelled" | "failed" | "timed_out";
+export type ScanStatus = "idle" | "reserved" | "queued" | "settling" | "waiting_for_eye_camera" | "opening_camera" | "framing" | "capturing" | "transcribing" | "reviewing" | "preview" | "cancelling" | "accepted" | "rejected" | "unchanged" | "cancelled" | "failed" | "timed_out";
 export type ScanJob = {
   job_id: string | null;
   trigger_id: string | null;
@@ -103,6 +103,15 @@ export function getScanJob(id: string, signal?: AbortSignal) {
   return controlRequest<ScanJob>(`/v1/scan-jobs/${encodeURIComponent(id)}?include_result=true`, { signal });
 }
 
+export type LiveCameraFrame = { data_url: string; width: number; height: number; captured_at: number };
+export type LiveCameraPreview = {
+  job_id: string; status: ScanStatus; camera_index: number; frame: LiveCameraFrame | null;
+};
+
+export function getLiveCameraPreview(id: string, signal?: AbortSignal) {
+  return controlRequest<LiveCameraPreview>(`/v1/scan-jobs/${encodeURIComponent(id)}/preview`, { signal });
+}
+
 export function createScanJob(cameraIndex: number, source: "manual" | "test", eyeCameraIndex?: number) {
   return controlRequest<ScanJob>("/v1/scan-jobs", {
     method: "POST",
@@ -125,6 +134,8 @@ export type TrackerSettings = {
   applied_blink_only: boolean | null;
   tracker_connected: boolean;
   eye_camera_index?: number | null;
+  camera_pause_job_id?: string | null;
+  eye_camera_state?: "released" | "opening" | "open" | "closing" | "error" | null;
 };
 
 export function getTrackerSettings(signal?: AbortSignal) {

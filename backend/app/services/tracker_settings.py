@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from copy import deepcopy
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Response
@@ -18,6 +19,7 @@ from app.services.eye_telemetry import (
 )
 
 HEARTBEAT_TIMEOUT_SECONDS = 3.0
+EyeCameraState = Literal["released", "opening", "open", "closing", "error"]
 
 
 class TrackerSettingsStore:
@@ -33,6 +35,10 @@ class TrackerSettingsStore:
         self._applied_blink_only: bool | None = None
         self._session: str | None = None
         self._eye_camera: int | None = None
+        self._eye_camera_state: EyeCameraState = "released"
+        self._camera_pause_job_id: str | None = None
+        self._camera_pause_required_session: str | None = None
+        self._camera_pause_release_seen = False
         self._last_ack: float | None = None
         self._diagnostics: dict | None = None
         self._diagnostics_sequence = 0
@@ -52,6 +58,8 @@ class TrackerSettingsStore:
             "tracker_connected": connected,
             "tracker_session_id": self._session if connected else None,
             "eye_camera_index": self._eye_camera if connected else None,
+            "eye_camera_state": self._eye_camera_state if connected else None,
+            "camera_pause_job_id": self._camera_pause_job_id,
         }
 
     def snapshot(self) -> dict:
@@ -65,8 +73,40 @@ class TrackerSettingsStore:
                 self._revision = uuid4().hex
             return self._snapshot()
 
+    def request_camera_pause(self, job_id: str) -> None:
+        """Keep the eye camera paused until this exact job finishes cleanup."""
+        with self._lock:
+            if self._camera_pause_job_id not in (None, job_id):
+                raise RuntimeError("Another camera handoff is active.")
+            if self._camera_pause_job_id == job_id:
+                return
+            self._camera_pause_job_id = job_id
+            # Retain ownership evidence even after heartbeat expiry. An older
+            # tracker may ignore pauses and may not yet use the OS camera lease.
+            self._camera_pause_required_session = self._session
+            self._camera_pause_release_seen = (
+                self._session is None or self._eye_camera_state == "released"
+            )
+
+    def camera_pause_released(self, job_id: str) -> bool:
+        """A stale heartbeat must never stand in for an explicit camera release."""
+        with self._lock:
+            return (
+                self._camera_pause_job_id == job_id
+                and self._camera_pause_release_seen
+                and (self._session is None or self._eye_camera_state == "released")
+            )
+
+    def clear_camera_pause(self, job_id: str) -> None:
+        with self._lock:
+            if self._camera_pause_job_id == job_id:
+                self._camera_pause_job_id = None
+                self._camera_pause_required_session = None
+                self._camera_pause_release_seen = False
+
     def acknowledge(
         self, *, revision: str, blink_only: bool, tracker_session_id: str, eye_camera_index: int,
+        eye_camera_state: EyeCameraState = "open",
     ) -> dict:
         with self._lock:
             if revision != self._revision or blink_only != self._blink_only:
@@ -85,6 +125,12 @@ class TrackerSettingsStore:
             self._applied_blink_only = blink_only
             self._session = tracker_session_id
             self._eye_camera = eye_camera_index
+            self._eye_camera_state = eye_camera_state
+            if self._camera_pause_job_id is not None:
+                if self._camera_pause_required_session is None:
+                    self._camera_pause_required_session = tracker_session_id
+                if self._camera_pause_required_session == tracker_session_id:
+                    self._camera_pause_release_seen = eye_camera_state == "released"
             self._last_ack = self._clock()
             return self._snapshot()
 
@@ -142,6 +188,7 @@ class TrackerSettingsAck(TrackerSettingsPatch):
     revision: str = Field(min_length=1, max_length=100)
     tracker_session_id: str = Field(min_length=1, max_length=100)
     eye_camera_index: int = Field(ge=0, le=10)
+    eye_camera_state: EyeCameraState = "open"
 
 
 tracker_settings = TrackerSettingsStore()

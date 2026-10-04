@@ -24,6 +24,9 @@ class TrackerControlSnapshot:
     revision: str | None
     turns_blocked: bool
     connected: bool
+    camera_pause_job_id: str | None
+    should_pause: bool
+    can_open_camera: bool
 
 
 def request_json(url: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -55,6 +58,8 @@ class TrackerControlClient:
         self._clock = clock
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._poll_wakeup = threading.Event()
+        self._released_acknowledged = threading.Event()
         self._events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
         self._poll_thread: threading.Thread | None = None
         self._dispatch_thread: threading.Thread | None = None
@@ -64,10 +69,13 @@ class TrackerControlClient:
         self._applied: tuple[str, bool, float] | None = None
         self._acknowledged_revision: str | None = None
         self._backend_busy = True
+        self._camera_pause_job_id: str | None = None
+        self._eye_camera_state = "released"
         self._dispatching = False
         self._guard_job_id: str | None = None
         self._last_failure = -float("inf")
         self._failed = False
+        self._closing = False
 
     def start(self) -> None:
         self._poll_thread = threading.Thread(
@@ -93,6 +101,7 @@ class TrackerControlClient:
             and 0 <= self._clock() - self._received_at <= CONTROL_STALE_SECONDS
         )
         connected = fresh and self._acknowledged_revision == self._desired_revision
+        pause_job = self._camera_pause_job_id or self._guard_job_id
         return TrackerControlSnapshot(
             blink_only=self._desired_blink_only if fresh else False,
             revision=self._desired_revision if fresh else None,
@@ -100,18 +109,37 @@ class TrackerControlClient:
                 not connected or self._backend_busy
                 or (self._dispatching and not ignore_own_dispatch)
                 or self._guard_job_id is not None or self._stop.is_set()
+                or self._closing
+                or self._eye_camera_state != "open" or pause_job is not None
             ),
             connected=connected,
+            camera_pause_job_id=pause_job,
+            should_pause=pause_job is not None or (fresh and self._backend_busy),
+            can_open_camera=(
+                connected and not self._backend_busy and pause_job is None
+                and not self._dispatching and not self._stop.is_set()
+                and not self._closing
+            ),
         )
 
     def snapshot(self) -> TrackerControlSnapshot:
         with self._lock:
             return self._snapshot_locked()
 
-    def applied(self, revision: str | None, blink_only: bool) -> None:
-        """Called only after the camera loop has applied a desired revision."""
+    def applied(
+        self, revision: str | None, blink_only: bool, *, eye_camera_state: str = "open",
+    ) -> None:
+        """Heartbeat the main loop, including real camera state while paused."""
+        if eye_camera_state not in {"released", "opening", "open", "closing", "error"}:
+            raise ValueError("Unknown eye camera state")
         with self._lock:
+            changed = self._eye_camera_state != eye_camera_state
+            self._eye_camera_state = eye_camera_state
             self._applied = None if revision is None else (revision, blink_only, self._clock())
+            if changed:
+                self._released_acknowledged.clear()
+        if changed:
+            self._poll_wakeup.set()
 
     def poll_once(self) -> None:
         try:
@@ -137,9 +165,16 @@ class TrackerControlClient:
                 self._desired_revision = desired["revision"]
                 self._received_at = self._clock()
                 self._backend_busy = latest["status"] not in TERMINAL_STATES
+                self._camera_pause_job_id = desired.get("camera_pause_job_id")
                 if guard_job == self._guard_job_id and guarded["status"] in TERMINAL_STATES:
                     self._guard_job_id = None
                 applied = self._applied
+                eye_camera_state = self._eye_camera_state
+                if self._closing and eye_camera_state == "released":
+                    # No gestures run after shutdown starts. A fresh settings
+                    # read lets the final release ack survive a stale revision
+                    # or API restart during camera teardown.
+                    applied = (desired["revision"], desired["blink_only"], self._clock())
             # The UI's "applied" indication comes from the actual video loop,
             # never merely from this network worker receiving the desired value.
             if (
@@ -150,9 +185,12 @@ class TrackerControlClient:
                     "revision": applied[0], "blink_only": applied[1],
                     "tracker_session_id": self.session_id,
                     "eye_camera_index": self.eye_camera_index,
+                    "eye_camera_state": eye_camera_state,
                 })
                 with self._lock:
                     self._acknowledged_revision = applied[0]
+                    if eye_camera_state == "released" and self._eye_camera_state == "released":
+                        self._released_acknowledged.set()
             else:
                 with self._lock:
                     self._acknowledged_revision = None
@@ -163,6 +201,7 @@ class TrackerControlClient:
             with self._lock:
                 self._received_at = None
                 self._acknowledged_revision = None
+                self._released_acknowledged.clear()
             now = self._clock()
             if not self._failed or now - self._last_failure >= 10:
                 self._event("tracker", f"Tracker controls unavailable; page turns paused: {error}")
@@ -172,7 +211,8 @@ class TrackerControlClient:
     def _poll_forever(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
-            self._stop.wait(POLL_SECONDS)
+            self._poll_wakeup.wait(POLL_SECONDS)
+            self._poll_wakeup.clear()
 
     def dispatch_flip(self) -> bool:
         """Try this gesture once; busy gestures are discarded, never deferred."""
@@ -236,6 +276,28 @@ class TrackerControlClient:
                 or not math.isfinite(expiry) or expiry - time.time() < 1.5
             ):
                 raise ValueError("Page-turn reservation is too short for a safe serial send")
+            # The guard above immediately asks the main loop to close the eye
+            # camera. Its acknowledgement means read thread + release finished.
+            release_deadline = min(self._clock() + 10.0,
+                                   self._clock() + expiry - time.time() - 1.5)
+            while True:
+                with self._lock:
+                    released = (
+                        self._eye_camera_state == "released"
+                        and self._released_acknowledged.is_set()
+                    )
+                    closing = self._closing
+                if closing:
+                    raise ValueError("Tracker is closing; page turn skipped")
+                if released:
+                    break
+                if self._stop.wait(0.05) or self._clock() >= release_deadline:
+                    raise ValueError("Eye camera did not release in time; page turn skipped")
+            current = self._request(f"{self.base_url}/v1/scan-jobs/{job_id}")
+            if current.get("status") != "reserved":
+                raise ValueError("Page-turn reservation is no longer active; page turn skipped")
+            if expiry - time.time() < 1.5 or self._stop.is_set() or self._closing:
+                raise ValueError("Page-turn reservation expired while releasing the eye camera")
             # No camera-loop callback writes serial until reserve succeeds.
             self._send_command("flip right")
             sent = True
@@ -263,8 +325,25 @@ class TrackerControlClient:
                 # sequence, even if reserve failed before its response arrived.
                 self._received_at = None
 
+    def begin_shutdown(self) -> None:
+        """Stop commands while keeping the camera-release heartbeat alive."""
+        with self._lock:
+            self._closing = True
+
     def close(self) -> None:
+        self.begin_shutdown()
+        with self._lock:
+            released = self._eye_camera_state == "released"
+        if released and self._poll_thread is not None and self._poll_thread.is_alive():
+            self._released_acknowledged.clear()
+            self._poll_wakeup.set()
+            if not self._released_acknowledged.wait(timeout=2.0):
+                self._event(
+                    "tracker",
+                    "Eye camera released locally; final API acknowledgement unavailable.",
+                )
         self._stop.set()
+        self._poll_wakeup.set()
         if self._dispatch_thread is not None:
             self._dispatch_thread.join(timeout=6)
         if self._poll_thread is not None:

@@ -32,6 +32,7 @@ scan_job_coordinator = ScanJobCoordinator(
     openai_api_key=settings.openai_api_key,
     openai_model=settings.openai_ocr_model,
     openai_revision_model=settings.openai_ocr_review_model,
+    tracker_settings_store=tracker_settings_service.tracker_settings,
 )
 
 
@@ -200,6 +201,12 @@ def read_scan_job(job_id: str, response: Response,
 @app.post("/v1/scan-jobs/{job_id}/capture", status_code=202)
 def capture_scan_job(job_id: str) -> dict[str, object]:
     return scan_operation(scan_job_coordinator.capture, job_id)
+
+
+@app.get("/v1/scan-jobs/{job_id}/preview")
+def scan_job_preview(job_id: str, response: Response) -> dict[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    return scan_operation(scan_job_coordinator.preview, job_id)
 
 
 @app.post("/v1/scan-jobs/{job_id}/cancel", status_code=202)

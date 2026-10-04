@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -36,6 +37,21 @@ def framing_worker(config, messages, cancel, capture):
         pass
     messages.put({"kind": "cancelled"} if cancel.is_set() else
                  {"kind": "result", "result": fake_result()})
+
+
+def preview_worker(config, messages, cancel, capture):
+    frame = {"data_url": "data:image/jpeg;base64,/9j/2Q==", "width": 640,
+             "height": 360, "captured_at": time.time()}
+    messages.put({"kind": "progress", "status": "framing", "message": "Frame the page."})
+    messages.put({"kind": "frame", "frame": frame})
+    while not cancel.is_set() and not capture.wait(0.02):
+        pass
+    if cancel.is_set():
+        messages.put({"kind": "cancelled"})
+    else:
+        messages.put({"kind": "progress", "status": "capturing", "message": "Capturing page."})
+        messages.put({"kind": "frame", "frame": frame})  # A late image must be ignored.
+        messages.put({"kind": "result", "result": fake_result()})
 
 
 def late_result_worker(config, messages, cancel, capture):
@@ -275,7 +291,9 @@ def test_api_validates_cameras_and_configuration_before_camera_access(monkeypatc
     coordinator = ScanJobCoordinator()
     monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
     client = TestClient(main.app)
-    assert client.post("/v1/scan-jobs", json={"camera_index": 2}).status_code == 503
+    assert client.post("/v1/scan-jobs", json={
+        "camera_index": 2, "source": "automatic",
+    }).status_code == 503
     response = client.post("/v1/auto-scans", json={"trigger_id": "same-camera",
                             "camera_index": 1, "eye_camera_index": 1})
     assert response.status_code == 400
@@ -476,3 +494,143 @@ def test_api_enforces_post_turn_minimum_but_manual_capture_starts_immediately(
     # Expire the cancellation safety guard without running a camera/provider.
     tick[0] = 140
     assert wait_for(coordinator, job["job_id"])["status"] == "cancelled"
+
+
+def wait_for_preview(coordinator, job_id):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        preview = coordinator.preview(job_id)
+        if preview["frame"] is not None:
+            return preview
+        time.sleep(0.02)
+    raise AssertionError("Worker did not publish a live preview.")
+
+
+def test_live_preview_is_separate_fresh_read_only_and_clears_on_capture(
+    monkeypatch, coordinator_factory,
+):
+    tick = [100.0]
+    coordinator = coordinator_factory(worker=preview_worker, clock=lambda: tick[0])
+    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
+    client = TestClient(main.app)
+    job = coordinator.start_scan(camera_index=2)
+    job_id = job["job_id"]
+    live = wait_for_preview(coordinator, job_id)
+    runtime = coordinator._active
+    process_id = runtime["process"].pid
+    assert live["frame"]["width"] == 640
+    assert "data_url" not in json.dumps(coordinator.latest())
+    assert "data_url" not in json.dumps(coordinator.get(job_id, include_result=True))
+    for _ in range(3):
+        response = client.get(f"/v1/scan-jobs/{job_id}/preview")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == live
+    assert coordinator._active is runtime
+    assert runtime["process"].pid == process_id
+    assert len(coordinator._jobs) == 1
+    tick[0] = 102.01
+    assert client.get(f"/v1/scan-jobs/{job_id}/preview").json()["frame"] is None
+    coordinator.capture(job_id)
+    assert wait_for(coordinator, job_id)["status"] == "accepted"
+    assert runtime["preview_frame"] is None
+    assert coordinator.preview(job_id)["frame"] is None
+    assert client.get("/v1/scan-jobs/missing/preview").status_code == 404
+
+
+def test_preview_cancel_and_later_job_never_reveal_an_old_frame(coordinator_factory):
+    coordinator = coordinator_factory(worker=preview_worker)
+    first = coordinator.start_scan(camera_index=2)
+    wait_for_preview(coordinator, first["job_id"])
+    coordinator.cancel(first["job_id"])
+    assert coordinator.preview(first["job_id"])["frame"] is None
+    wait_for(coordinator, first["job_id"])
+    second = coordinator.start_scan(camera_index=3)
+    wait_for_preview(coordinator, second["job_id"])
+    assert coordinator.preview(second["job_id"])["camera_index"] == 3
+    old = coordinator.preview(first["job_id"])
+    assert old["camera_index"] == 2
+    assert old["frame"] is None
+    coordinator.cancel(second["job_id"])
+    wait_for(coordinator, second["job_id"])
+
+
+def test_preview_bounds_and_frozen_frames_cannot_extend_freshness(coordinator_factory):
+    tick = [100.0]
+    coordinator = coordinator_factory(worker=preview_worker, clock=lambda: tick[0])
+    job = coordinator.start_scan(camera_index=2)
+    live = wait_for_preview(coordinator, job["job_id"])
+    runtime = coordinator._active
+    frame = live["frame"]
+    expiry = runtime["preview_expires"]
+    tick[0] = 101
+    invalid_updates = [
+        {"data_url": "data:image/png;base64,abc"},
+        {"data_url": "data:image/jpeg;base64," + "A" * scan_jobs_module.MAX_PREVIEW_DATA_BYTES},
+        {"width": 961}, {"height": True},
+        {"captured_at": time.time() - 5}, {"captured_at": time.time() + 5},
+        {"captured_at": float("nan")}, {"captured_at": 10**400},
+    ]
+    with coordinator._lock:
+        for update in invalid_updates:
+            coordinator._store_preview(runtime, {**frame, **update})
+        coordinator._store_preview(runtime, frame)  # Same capture cannot reset its deadline.
+    assert runtime["preview_frame"] == frame
+    assert runtime["preview_expires"] == expiry
+    tick[0] = 102.01
+    assert coordinator.preview(job["job_id"])["frame"] is None
+    coordinator.cancel(job["job_id"])
+    wait_for(coordinator, job["job_id"])
+
+
+def test_manual_live_preview_can_start_without_provider_keys_but_turns_cannot(monkeypatch):
+    coordinator = ScanJobCoordinator(worker=preview_worker)
+    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
+    client = TestClient(main.app)
+    try:
+        response = client.post("/v1/scan-jobs", json={"source": "manual", "camera_index": 2})
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+        wait_for_preview(coordinator, job_id)
+        coordinator.cancel(job_id)
+        wait_for(coordinator, job_id)
+        automatic = client.post("/v1/page-turns/reserve", json={
+            "trigger_id": "no-key", "eye_camera_index": 1, "camera_index": 2,
+        })
+        assert automatic.status_code == 503
+    finally:
+        coordinator.shutdown()
+
+
+def test_worker_drops_preview_frames_when_channel_is_full_without_blocking_ocr(monkeypatch):
+    from app.services import book_scanner
+    from app.services.scan_worker import run_scan_worker
+
+    class FullFrameChannel:
+        def __init__(self):
+            self.dropped = 0
+            self.control_messages = []
+
+        def put_nowait(self, message):
+            assert message["kind"] == "frame"
+            self.dropped += 1
+            raise queue.Full()
+
+        def put(self, message):
+            self.control_messages.append(message)
+
+    def fake_scan(camera_index, **options):
+        assert camera_index == 2
+        assert options["show_preview"] is True
+        options["progress"]("framing", "Frame the page.")
+        for _ in range(10):
+            options["frame_callback"]({"data_url": "data:image/jpeg;base64,/9j/2Q=="})
+        return fake_result()
+
+    channel = FullFrameChannel()
+    monkeypatch.setattr(book_scanner, "scan_camera", fake_scan)
+    run_scan_worker({"camera_index": 2, "source": "manual", "openai_api_key": "",
+                     "openai_model": "", "openai_revision_model": ""},
+                    channel, threading.Event(), threading.Event())
+    assert channel.dropped == 10
+    assert [message["kind"] for message in channel.control_messages] == ["progress", "result"]

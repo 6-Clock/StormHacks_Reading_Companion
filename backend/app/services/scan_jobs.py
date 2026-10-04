@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import multiprocessing
 import queue
 import threading
@@ -19,12 +20,18 @@ from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from app.services.scan_worker import run_scan_worker
+from app.services.scan_worker import CAMERA_HANDOFF_TIMEOUT_SECONDS, run_scan_worker
+from app.services.tracker_settings import TrackerSettingsStore
 
 TERMINAL_STATUSES = {"accepted", "rejected", "unchanged", "cancelled", "failed", "timed_out"}
 MIN_PAGE_SETTLE_SECONDS = 8.0
 MAX_PAGE_SETTLE_SECONDS = 30.0
+PREVIEW_STALE_SECONDS = 2.0
+MAX_PREVIEW_DATA_BYTES = 200 * 1024
+MAX_PREVIEW_EDGE = 960
+WORKER_MESSAGE_CAPACITY = 8
 STAGE_TIMEOUTS = {
+    "waiting_for_eye_camera": 15.0,
     "settling": MAX_PAGE_SETTLE_SECONDS + 5.0, "opening_camera": 15.0, "framing": 60.0,
     "capturing": 15.0, "transcribing": 55.0, "reviewing": 55.0, "preview": 8.0,
 }
@@ -44,14 +51,16 @@ class ScanJobCoordinator:
     def __init__(
         self, *, openai_api_key: str = "", openai_model: str = "",
         openai_revision_model: str = "", worker: Callable[..., None] = run_scan_worker,
-        reservation_seconds: float = 5.0, cancellation_grace: float = 1.0,
+        reservation_seconds: float = 15.0, cancellation_grace: float = 1.0,
         overall_timeout: float = 180.0, stage_timeouts: dict[str, float] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        tracker_settings_store: TrackerSettingsStore | None = None,
     ) -> None:
         self._provider = {"openai_api_key": openai_api_key, "openai_model": openai_model,
                           "openai_revision_model": openai_revision_model}
         self._worker = worker
         self._clock = clock
+        self._tracker_settings = tracker_settings_store or TrackerSettingsStore()
         self._context = multiprocessing.get_context("spawn")
         self._lock = threading.RLock()
         self._jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -78,6 +87,9 @@ class ScanJobCoordinator:
                               "type": "scan_job", "message": message})
         if self._active is not None:
             self._active["stage_since"] = self._clock()
+            if status != "framing":
+                self._active["preview_frame"] = None
+                self._active["preview_expires"] = -math.inf
         print(f"[OCR {job['job_id'][:8]}] {status}: {message}", flush=True)
 
     def _create(
@@ -113,8 +125,9 @@ class ScanJobCoordinator:
                         return self._snapshot(job)
             if self._active is not None:
                 raise ScanBusyError(BUSY_MESSAGE)
-            # Fail before opening hardware or reserving a physical page turn.
-            if camera_index is not None and not all(
+            # Automatic turns require OCR config before hardware dispatch. Manual
+            # preview may open without it; Capture now validates before OCR.
+            if camera_index is not None and source != "manual" and not all(
                 self._provider[key] for key in ("openai_api_key", "openai_model")
             ):
                 raise RuntimeError(
@@ -132,6 +145,8 @@ class ScanJobCoordinator:
                        "capture": self._context.Event(), "messages": None,
                        "stage_since": self._clock(), "created": self._clock(),
                        "scan_start_monotonic": None,
+                       "camera_handoff_since": None,
+                       "preview_frame": None, "preview_expires": -math.inf,
                        "cancel_since": None, "cancel_status": "cancelled", "thread": None}
             # A reserve response can already be in transit when Cancel is clicked.
             # Keep ownership until its final possible dispatch has had time to settle.
@@ -139,6 +154,10 @@ class ScanJobCoordinator:
                 runtime["created"] + self._reservation_seconds + settle_seconds
                 if reserved else 0.0
             )
+            # Publish the pause before the accepted job or reservation can be
+            # observed. Tracker heartbeat expiry is never proof of camera release;
+            # the worker also needs the OS camera lease before touching hardware.
+            self._tracker_settings.request_camera_pause(job_id)
             self._active = runtime
             self._jobs[job_id] = job
             self._latest_id = job_id
@@ -184,7 +203,9 @@ class ScanJobCoordinator:
                 scan_starts_at=time.time() + job["settle_seconds"],
             )
         else:
-            self._transition(job, "opening_camera", f"Opening camera {job['camera_index']}.")
+            self._transition(
+                job, "waiting_for_eye_camera", "Waiting for the eye camera to release.",
+            )
 
     def reserve(self, *, trigger_id: str, eye_camera_index: int, camera_index: int | None,
                 settle_seconds: float = MIN_PAGE_SETTLE_SECONDS) -> dict[str, Any]:
@@ -212,6 +233,7 @@ class ScanJobCoordinator:
             if job["status"] != "framing" or self._active is None:
                 raise ScanBusyError("Capture is available while framing the page.")
             self._active["capture"].set()
+            self._transition(job, "capturing", "Capture requested; selecting sharp page frames.")
             return self._snapshot(job)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
@@ -243,6 +265,7 @@ class ScanJobCoordinator:
                                   "word_count": len(str(result.get("text", "")).split())}
         self._transition(job, status, message, **fields)
         if self._active is runtime:
+            self._tracker_settings.clear_camera_pause(job["job_id"])
             self._active = None
 
     def _drain_messages(self, runtime: dict[str, Any], pending: dict[str, Any] | None):
@@ -251,12 +274,42 @@ class ScanJobCoordinator:
                 event = runtime["messages"].get_nowait()
             except queue.Empty:
                 return pending
-            if event["kind"] == "progress":
+            if event["kind"] == "frame":
+                self._store_preview(runtime, event.get("frame"))
+            elif event["kind"] == "progress":
                 stage = event["status"]
                 if stage in self._stage_timeouts:
                     self._transition(runtime["job"], stage, event["message"])
             else:
                 pending = event
+
+    def _store_preview(self, runtime: dict[str, Any], frame: Any) -> None:
+        """Keep one bounded frame outside job snapshots and logs; caller holds lock."""
+        job = runtime["job"]
+        if (self._active is not runtime or job["source"] != "manual"
+            or job["status"] != "framing" or not isinstance(frame, dict)):
+            return
+        data_url = frame.get("data_url")
+        width, height, captured_at = (frame.get(key) for key in ("width", "height", "captured_at"))
+        if (not isinstance(data_url, str) or not data_url.startswith("data:image/jpeg;base64,")
+            or len(data_url) > MAX_PREVIEW_DATA_BYTES or not data_url.isascii()
+            or type(width) is not int or type(height) is not int
+            or not 1 <= width <= MAX_PREVIEW_EDGE or not 1 <= height <= MAX_PREVIEW_EDGE
+            or isinstance(captured_at, bool) or not isinstance(captured_at, (int, float))):
+            return
+        try:
+            age = time.time() - captured_at
+        except OverflowError:
+            return
+        if not math.isfinite(age) or not -0.25 <= age < PREVIEW_STALE_SECONDS:
+            return
+        previous = runtime["preview_frame"]
+        if previous is not None and captured_at <= previous["captured_at"]:
+            return  # A frozen/reordered frame cannot renew the freshness deadline.
+        runtime["preview_frame"] = {
+            "data_url": data_url, "width": width, "height": height, "captured_at": captured_at,
+        }
+        runtime["preview_expires"] = self._clock() + PREVIEW_STALE_SECONDS - max(0, age)
 
     def _monitor(self, runtime: dict[str, Any]) -> None:
         pending: dict[str, Any] | None = None
@@ -306,7 +359,22 @@ class ScanJobCoordinator:
                                 runtime, "accepted", "Page turn settled; blink detection ready.",
                             )
                             return
-                        messages = self._context.Queue()
+                        if runtime["camera_handoff_since"] is None:
+                            runtime["camera_handoff_since"] = now
+                            self._transition(
+                                job, "waiting_for_eye_camera",
+                                "Waiting for the eye camera to release.",
+                            )
+                        if now - runtime["camera_handoff_since"] >= CAMERA_HANDOFF_TIMEOUT_SECONDS:
+                            self._request_cancel(
+                                runtime, "timed_out",
+                                "Eye camera did not confirm release; stop/restart the tracker, "
+                                "or restart the API after closing it.",
+                            )
+                            continue
+                        if not self._tracker_settings.camera_pause_released(job["job_id"]):
+                            continue
+                        messages = self._context.Queue(maxsize=WORKER_MESSAGE_CAPACITY)
                         config = {**self._provider, "camera_index": job["camera_index"],
                                   "source": job["source"]}
                         process = self._context.Process(
@@ -316,7 +384,7 @@ class ScanJobCoordinator:
                         )
                         runtime.update(process=process, messages=messages)
                         self._transition(
-                            job, "opening_camera", f"Opening camera {job['camera_index']}.",
+                            job, "waiting_for_eye_camera", "Waiting for the eye camera to release.",
                         )
                         process.start()
                     pending = self._drain_messages(runtime, pending)
@@ -364,6 +432,10 @@ class ScanJobCoordinator:
                 if process.is_alive():
                     process.kill()
                 process.join()
+            # An unexpected supervisor failure must retain the same physical
+            # page-turn guard as ordinary cancellation before the tracker resumes.
+            while self._clock() < runtime["guard_until"]:
+                time.sleep(max(0, min(0.1, runtime["guard_until"] - self._clock())))
             with self._lock:
                 self._finish(runtime, "failed", f"Could not run OCR ({type(error).__name__}).")
         finally:
@@ -384,6 +456,18 @@ class ScanJobCoordinator:
     def get(self, job_id: str, *, include_result: bool = False) -> dict[str, Any]:
         with self._lock:
             return self._snapshot(self._jobs[job_id], include_result)
+
+    def preview(self, job_id: str) -> dict[str, Any]:
+        """Read a fresh framing image without opening or touching the camera."""
+        with self._lock:
+            job = self._jobs[job_id]
+            runtime = self._active
+            frame = None
+            if (runtime is not None and runtime["job"] is job and job["status"] == "framing"
+                and self._clock() < runtime["preview_expires"]):
+                frame = copy.deepcopy(runtime["preview_frame"])
+            return {"job_id": job_id, "status": job["status"],
+                    "camera_index": job["camera_index"], "frame": frame}
 
     def shutdown(self) -> None:
         with self._lock:
