@@ -1,44 +1,40 @@
-// Run with gstack browse on localhost, then reload. All API calls here are fixtures.
+// Evaluate on a fresh local reader page. All /v1 requests are fixtures.
 return (async () => {
   const assert = (value, label) => { if (!value) throw new Error(label); };
   const waitFor = async (check, label) => {
-    const end = Date.now() + 7000;
+    const end = Date.now() + 9000;
     while (!check()) {
       if (Date.now() > end) throw new Error(`Timed out: ${label}`);
-      await new Promise(resolve => setTimeout(resolve, 40));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   };
   const button = label => [...document.querySelectorAll('button')].find(el => el.textContent.trim() === label);
   const picture = () => document.querySelector('img[alt="Live OCR camera 2"]');
-  const canvas = document.createElement('canvas'); canvas.width = 8; canvas.height = 8;
-  const jpeg = color => { canvas.getContext('2d').fillStyle = color; canvas.getContext('2d').fillRect(0, 0, 8, 8); return canvas.toDataURL('image/jpeg'); };
-  let frameImage = jpeg('#aa2222');
-  let frozen = false;
-  let freezeTime = 0;
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
+  const jpeg = color => { canvas.getContext('2d').fillStyle=color; canvas.getContext('2d').fillRect(0,0,8,8); return canvas.toDataURL('image/jpeg'); };
+  let image = jpeg('#aa2222');
   let starts = 0;
   let previews = 0;
   let job = {job_id:null, status:'idle', events:[]};
   const originalFetch = window.fetch;
   window.fetch = async (input, init = {}) => {
     const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
-    if (!path.startsWith('/v1/')) return originalFetch(input, init);
+    if (!path.startsWith('/v1/')) return originalFetch(input,init);
     let body;
-    if (path === '/v1/tracker-settings') body = {blink_only:false,revision:'one',applied_revision:null,tracker_connected:false};
-    else if (path === '/v1/diagnostics/eyes') body = {connected:false,events:[]};
-    else if (path === '/v1/scan-jobs/latest') body = job;
+    if (path === '/v1/tracker-settings') body = {blink_only:false,revision:'fixture',applied_revision:'fixture',tracker_connected:false};
+    else if (path === '/v1/diagnostics/eyes') body = {connected:false,updated_at:null,events:[]};
+    else if (path === '/v1/scan-jobs/latest') { body = {...job}; delete body.result; }
     else if (path === '/v1/scan-jobs' && init.method === 'POST') {
       starts++;
-      job = {job_id:'live-test',source:'manual',camera_index:2,status:'opening_camera',message:'Opening camera 2.',events:[]};
-      body = job;
+      job = {job_id:'live-test',source:'manual',camera_index:2,status:'opening_camera',message:'Opening camera',events:[]}; body = job;
     } else if (path.endsWith('/preview')) {
       previews++;
-      body = {...job,frame:job.status === 'framing' ? {data_url:frameImage,width:8,height:8,captured_at:frozen ? freezeTime : Date.now()/1000} : null};
+      body = {...job,frame:job.status === 'framing' ? {data_url:image,width:8,height:8,captured_at:Date.now()/1000} : null};
     } else if (path.endsWith('/capture')) {
-      job = {...job,status:'transcribing',message:'Reading text'}; body = job;
-    } else if (path.endsWith('/cancel')) {
-      job = {...job,status:'cancelled',message:'Camera released'}; body = job;
-    } else if (path === '/v1/scan-jobs/live-test') body = job;
-    else throw new Error(`Unexpected QA API call: ${path}`);
+      job = {...job,status:'captured',message:'Page captured',result:{data_url:image,width:8,height:8,captured_at:Date.now()/1000,page_detected:true}}; body = job;
+    } else if (path.endsWith('/cancel')) { job = {...job,status:'cancelled',message:'Camera released'}; body = job; }
+    else if (path === '/v1/scan-jobs/live-test') body = job;
+    else throw new Error(`Unexpected API call: ${path}`);
     return new Response(JSON.stringify(body), {status:200,headers:{'Content-Type':'application/json'}});
   };
   await waitFor(() => document.querySelector('[aria-label="Open Developer view"]'), 'reader');
@@ -46,29 +42,28 @@ return (async () => {
   await waitFor(() => button('Live camera') && !button('Live camera').disabled, 'preview control');
   button('Live camera').click();
   await waitFor(() => document.querySelector('[aria-label="Live book camera"]'), 'opening preview');
-  assert(!picture(), 'opening must not invent a frame');
+  assert(!picture(), 'opening does not invent a frame');
   job = {...job,status:'framing',message:'Frame the page'};
-  await waitFor(() => picture(), 'real frame response displayed');
-  assert(button('Live camera').disabled && button('Test 3 blinks').disabled, 'preview reserves scanner');
+  await waitFor(() => picture(), 'captured frame shown');
   const first = picture().src;
-  frameImage = jpeg('#2255aa');
-  await waitFor(() => picture()?.src !== first, 'successive frames update');
-  frozen = true; freezeTime = Date.now()/1000;
-  await waitFor(() => !picture(), 'stale frames disappear');
-  frozen = false;
-  await waitFor(() => picture(), 'fresh camera recovers');
+  image = jpeg('#2255aa');
+  await waitFor(() => picture()?.src !== first, 'frames update');
   document.querySelector('[aria-label="Return to Reader view"]').click();
-  await waitFor(() => !picture(), 'Reader hides live preview');
+  await waitFor(() => !picture(), 'reader hides preview');
   const beforeHidden = previews;
-  await new Promise(resolve => setTimeout(resolve, 650));
-  assert(previews === beforeHidden, 'hidden Developer view must stop preview polling');
+  await new Promise(resolve => setTimeout(resolve,650));
+  assert(previews === beforeHidden, 'hidden Developer panel stops preview requests');
   document.querySelector('[aria-label="Open Developer view"]').click();
-  await waitFor(() => picture(), 'Developer resumes preview');
+  await waitFor(() => picture(), 'Developer panel resumes preview');
   button('Capture now').click();
-  await waitFor(() => !document.querySelector('[aria-label="Live book camera"]'), 'capture clears live image');
-  assert(starts === 1, 'capture reuses the preview job');
-  assert(document.body.innerText.includes('Reading text'), 'capture starts OCR');
+  await waitFor(() => !document.querySelector('[aria-label="Live book camera"]'), 'capture closes live preview');
+  await waitFor(() => document.querySelector('img[alt="Latest book camera capture"]'), 'captured image shown');
+  assert(starts === 1, 'capture reuses the existing camera job');
+  assert(!document.querySelector('.scan-word-overlay'), 'capture has no OCR word boxes');
+  await waitFor(() => button('Live camera') && !button('Live camera').disabled, 'capture releases camera controls');
+  button('Live camera').click();
+  await waitFor(() => button('Cancel scan'), 'second live camera opens');
   button('Cancel scan').click();
-  await waitFor(() => !button('Live camera').disabled, 'cancel releases controls');
-  return {passed:['opening without fake frames','live frames update','preview reserves scanner','stale frames clear','fresh recovery','hidden preview suspends polling','capture reuses camera job','cancel releases controls'],starts,previews};
+  await waitFor(() => button('Live camera') && !button('Live camera').disabled, 'cancel releases camera');
+  return {passed:['opening without fake frames','frames update','hidden preview stops polling','capture reuses camera job','captured JPEG without word boxes','camera release and cancellation'],starts,previews};
 })()

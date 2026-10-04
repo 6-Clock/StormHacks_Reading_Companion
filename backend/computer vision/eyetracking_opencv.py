@@ -274,17 +274,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--auto-scan-api",
-        default="http://127.0.0.1:8001/v1/auto-scans",
-        help=(
-            "Local FastAPI URL for settings and page-turn coordination; "
-            "accepts the old OCR endpoint."
-        ),
-    )
-    parser.add_argument(
-        "--ocr-settle-seconds",
-        type=float,
-        default=8.0,
-        help="Seconds to wait after a flip before capturing the page (8–30; default: 8).",
+        default="http://127.0.0.1:8001",
+        help="Local FastAPI base URL for settings and automatic page capture.",
     )
     parser.add_argument(
         "--port",
@@ -318,14 +309,10 @@ def main() -> int:
     if not diagnostics_logger.handlers:
         diagnostics_logger.addHandler(logging.StreamHandler())
     diagnostics_logger.propagate = False
-    if not math.isfinite(args.serial_completion_timeout) or args.serial_completion_timeout <= 0:
-        parser.error("--serial-completion-timeout must be a positive finite number.")
     if args.ocr_camera is not None and args.ocr_camera == args.camera:
         parser.error("--ocr-camera must be different from --camera so each camera has one job.")
-    if not 8 <= args.ocr_settle_seconds <= 30:
-        parser.error("--ocr-settle-seconds must be between 8 and 30.")
-
-    # Wait for fresh API permission and the cross-process lease before opening.
+    if not math.isfinite(args.serial_completion_timeout) or args.serial_completion_timeout <= 0:
+        parser.error("--serial-completion-timeout must be a positive finite number.")
     reader = LatestFrameReader(args.camera, args.width, args.height, args.fps)
 
     try:
@@ -352,7 +339,6 @@ def main() -> int:
         args.auto_scan_api,
         eye_camera_index=args.camera,
         camera_index=args.ocr_camera,
-        settle_seconds=args.ocr_settle_seconds,
         send_command=command_sender.send,
         cancel_command=command_sender.cancel,
     )
@@ -443,8 +429,6 @@ def main() -> int:
                     text(display, 2, "Eye camera paused for book scanning")
                     text(display, 3, f"Camera state: {camera_state}")
                     text(display, 4, "Eye tracking resumes after the scan finishes.")
-                elif not control_state.connected:
-                    text(display, 2, "Waiting for the local API before opening camera")
                 elif camera_state == "error":
                     text(display, 2, "Eye camera unavailable; checking again shortly")
                     text(display, 3, "Check the camera index and close other camera apps.")
@@ -537,7 +521,7 @@ def main() -> int:
                 command = pending_commands.pop(0)
                 if command == "flip right" and not controls.dispatch_flip():
                     telemetry.event(
-                        "command", "Page turn skipped while scanner or tracker controls busy",
+                        "command", "Page turn skipped while camera is paused or MCU completion is pending",
                     )
             if snapshot.display_mode != previous_mode:
                 telemetry.event("mode", f"Mode changed to {snapshot.display_mode}")
@@ -579,7 +563,7 @@ def main() -> int:
             elif not blink_detector.calibrated:
                 text(frame, 7, "Press C to calibrate before testing blinks", (0, 190, 255))
             elif control_state.turns_blocked:
-                text(frame, 7, "Page turns paused: scanner busy or waiting for API", (0, 190, 255))
+                text(frame, 7, "Page turns paused: camera handoff or MCU completion pending", (0, 190, 255))
             elif controller.blink_only:
                 text(frame, 7, "Blink-only test: 3 blinks ready", (0, 220, 0))
             elif snapshot.toggle_armed:

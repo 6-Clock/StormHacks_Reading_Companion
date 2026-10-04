@@ -1,4 +1,4 @@
-// Run using gstack: browse goto http://localhost:3000; browse eval tests/browser/eye-diagnostics.js.
+// Evaluate on a fresh local reader page; tests/browser/run.mjs can run this fixture.
 // This page alone receives fixtures. No measurements are posted to the live tracker API.
 // Reload after the test to restore real API requests.
 return (async () => {
@@ -28,7 +28,8 @@ return (async () => {
       body = {blink_only:true,revision:'fixture',applied_revision:'fixture',applied_blink_only:true,tracker_connected:true,eye_camera_index:1};
     } else if (path === '/v1/scan-jobs/latest') {
       body = {job_id:null,trigger_id:null,status:'idle',message:'Ready to scan',events:[]};
-    } else return originalFetch(input, init);
+    } else if (path.startsWith('/v1/')) throw new Error(`Unexpected API call: ${path}`);
+    else return originalFetch(input, init);
     return new Response(JSON.stringify(body), {status:200,headers:{'Content-Type':'application/json'}});
   };
   await waitFor(() => document.querySelector('[aria-label="Open Developer view"]'), 'reader hydrated');
@@ -41,9 +42,6 @@ return (async () => {
   assert(!status().includes('Camera recorded'), 'no invented camera gesture');
   diagnostic.events = [{id:'fixture-blink-3',time:Date.now()/1000,type:'blink',message:'Blink 3/3 recorded (0.10s)'}];
   await waitFor(() => status().includes('Camera recorded 3 / 3'), 'completed camera event remains visible after counter reset');
-  diagnostic.turns_blocked = true;
-  await waitFor(() => status().includes('paused'), 'busy guard visible');
-  diagnostic.turns_blocked = false;
   diagnostic.eyes_visible = false;
   await waitFor(() => status().includes('both eyes'), 'lost face visible');
   diagnostic.eyes_visible = true;
@@ -52,5 +50,5 @@ return (async () => {
   await waitFor(() => status().includes('Waiting for live eye'), 'frozen capture expires despite repeated successful polls');
   freeze = false;
   await waitFor(() => status().includes('Ready'), 'fresh capture restores live state');
-  return {passed:['calibration readiness','real-event confirmation','busy and lost-face guards','frozen-frame expiry','fresh-frame recovery']};
+  return {passed:['calibration readiness','real-event confirmation','lost-face measurements','frozen-frame expiry','fresh-frame recovery']};
 })()

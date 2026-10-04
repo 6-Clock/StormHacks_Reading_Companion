@@ -1,75 +1,76 @@
 from __future__ import annotations
 
-import json
 import queue
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app import main
-from app.services import scan_jobs as scan_jobs_module
-from app.services.scan_jobs import TERMINAL_STATUSES, ScanBusyError, ScanJobCoordinator
+from app.services.scan_jobs import ScanBusyError, ScanJobCoordinator
 
 
-def fake_result(text="A freshly turned page."):
-    return {"accepted": True, "reason": "openai_vision_accepted", "text": text,
-            "metrics": {}, "capture_preview": None}
+def captured_image():
+    return {"data_url": "data:image/jpeg;base64,/9j/2Q==", "width": 640,
+            "height": 360, "captured_at": 123.5, "page_detected": True}
 
 
-# Top-level targets exercise real spawned processes, including force termination.
+# Spawn requires worker targets to be importable at module scope.
 def success_worker(config, messages, cancel, capture):
-    messages.put({"kind": "progress", "status": "transcribing", "message": "Transcribing."})
-    messages.put({"kind": "result",
-                  "result": fake_result(f"Page from camera {config['camera_index']}.")})
+    messages.put({"kind": "progress", "status": "capturing", "message": "Capturing."})
+    messages.put({"kind": "result", "result": captured_image()})
 
 
 def blocked_worker(config, messages, cancel, capture):
-    messages.put({"kind": "progress", "status": "capturing", "message": "Camera read blocked."})
+    messages.put({"kind": "progress", "status": "capturing", "message": "Blocked read."})
     time.sleep(60)
 
 
 def framing_worker(config, messages, cancel, capture):
+    first = {"data_url": "data:image/jpeg;base64,first", "width": 640,
+             "height": 360, "captured_at": 1.0}
+    last = {**first, "data_url": "data:image/jpeg;base64,last", "captured_at": 2.0}
     messages.put({"kind": "progress", "status": "framing", "message": "Frame the page."})
-    while not cancel.is_set() and not capture.wait(0.02):
-        pass
-    messages.put({"kind": "cancelled"} if cancel.is_set() else
-                 {"kind": "result", "result": fake_result()})
-
-
-def preview_worker(config, messages, cancel, capture):
-    frame = {"data_url": "data:image/jpeg;base64,/9j/2Q==", "width": 640,
-             "height": 360, "captured_at": time.time()}
-    messages.put({"kind": "progress", "status": "framing", "message": "Frame the page."})
-    messages.put({"kind": "frame", "frame": frame})
+    messages.put({"kind": "frame", "frame": first})
+    messages.put({"kind": "frame", "frame": last})
     while not cancel.is_set() and not capture.wait(0.02):
         pass
     if cancel.is_set():
         messages.put({"kind": "cancelled"})
     else:
-        messages.put({"kind": "progress", "status": "capturing", "message": "Capturing page."})
-        messages.put({"kind": "frame", "frame": frame})  # A late image must be ignored.
-        messages.put({"kind": "result", "result": fake_result()})
+        messages.put({"kind": "result", "result": captured_image()})
 
 
-def late_result_worker(config, messages, cancel, capture):
-    messages.put({"kind": "progress", "status": "reviewing", "message": "Reviewing."})
-    messages.put({"kind": "result", "result": fake_result()})
-    time.sleep(60)  # Result exists, but the worker still owns camera resources.
+def failing_worker(config, messages, cancel, capture):
+    messages.put({"kind": "error", "message": "Camera failed to open."})
+
+
+class Tracker:
+    def __init__(self):
+        self.paused = None
+        self.released = []
+        self.release_check = None
+
+    def request_camera_pause(self, job_id):
+        self.paused = job_id
+
+    def camera_pause_released(self, job_id):
+        return True
+
+    def clear_camera_pause(self, job_id):
+        assert self.paused == job_id
+        if self.release_check:
+            self.release_check()
+        self.paused = None
+        self.released.append(job_id)
 
 
 @pytest.fixture
-def coordinator_factory(monkeypatch):
-    # Lifecycle tests need not wait eight seconds for every fake page turn.
-    # Timing-specific tests below restore the production minimum explicitly.
-    monkeypatch.setattr(scan_jobs_module, "MIN_PAGE_SETTLE_SECONDS", 0.0)
+def coordinator_factory():
     instances = []
 
     def make(**kwargs):
         coordinator = ScanJobCoordinator(
-            openai_api_key="test-key", openai_model="test-model",
             worker=kwargs.pop("worker", success_worker), cancellation_grace=0.1, **kwargs,
         )
         instances.append(coordinator)
@@ -80,7 +81,8 @@ def coordinator_factory(monkeypatch):
         coordinator.shutdown()
 
 
-def wait_for(coordinator, job_id, statuses=TERMINAL_STATUSES):
+def wait_for(coordinator, job_id, statuses=None):
+    statuses = statuses or {"captured", "accepted", "rejected", "cancelled", "failed"}
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         job = coordinator.get(job_id, include_result=True)
@@ -90,147 +92,169 @@ def wait_for(coordinator, job_id, statuses=TERMINAL_STATUSES):
     raise AssertionError(f"Job never reached {statuses}: {coordinator.get(job_id)}")
 
 
-def test_reservation_prevents_manual_scan_and_second_turn_before_hardware(coordinator_factory):
+def test_automatic_capture_needs_no_provider_or_settling_delay(coordinator_factory):
     coordinator = coordinator_factory()
-    reserved = coordinator.reserve(trigger_id="flip-1", eye_camera_index=1,
-                                   camera_index=2, settle_seconds=0)
-    assert reserved["status"] == "reserved"
-    assert reserved["reservation_expires_at"] > time.time()
-    with pytest.raises(ScanBusyError):
-        coordinator.enqueue(source="manual", camera_index=2)
-    with pytest.raises(ScanBusyError):
-        coordinator.reserve(trigger_id="flip-2", eye_camera_index=1,
-                            camera_index=2, settle_seconds=0)
-    assert coordinator.reserve(trigger_id="flip-1", eye_camera_index=1,
-                               camera_index=2, settle_seconds=0)["job_id"] == reserved["job_id"]
-    coordinator.commit(reserved["job_id"])
-    coordinator.commit(reserved["job_id"])  # A network retry must not start another worker.
-    assert wait_for(coordinator, reserved["job_id"])["status"] == "accepted"
-
-
-def test_results_are_per_job_and_terminal_jobs_do_not_change(coordinator_factory):
-    coordinator = coordinator_factory()
-    first = coordinator.enqueue(camera_index=2, trigger_id="one")
-    first_result = wait_for(coordinator, first["job_id"])
-    second = coordinator.enqueue(camera_index=3, trigger_id="two")
-    wait_for(coordinator, second["job_id"])
-    assert coordinator.latest()["job_id"] == second["job_id"]
-    assert "result" not in coordinator.latest()
-    assert coordinator.get(first["job_id"], include_result=True) == first_result
-    coordinator.cancel(first["job_id"])
-    assert coordinator.get(first["job_id"], include_result=True) == first_result
-    assert coordinator.enqueue(camera_index=2, trigger_id="one")["job_id"] == first["job_id"]
-    with pytest.raises(ValueError):
-        coordinator.enqueue(camera_index=3, trigger_id="one")
-
-
-def test_cancel_stuck_camera_kills_worker_before_unlocking(coordinator_factory):
-    coordinator = coordinator_factory(worker=blocked_worker)
-    job = coordinator.enqueue(camera_index=2)
-    wait_for(coordinator, job["job_id"], {"capturing"})
-    runtime = coordinator._active
-    assert runtime is not None
-    assert coordinator.cancel(job["job_id"])["status"] == "cancelling"
-    with pytest.raises(ScanBusyError):
-        coordinator.enqueue(camera_index=2)
-    completed = wait_for(coordinator, job["job_id"])
-    assert completed["status"] == "cancelled"
-    assert "result" not in completed
-    # New work is accepted only once the process has been joined and gate released.
-    assert coordinator.start_scan(camera_index=2)["status"] == "opening_camera"
-
-
-def test_cancellation_wins_over_a_result_from_a_still_running_worker(coordinator_factory):
-    coordinator = coordinator_factory(worker=late_result_worker)
-    job = coordinator.enqueue(camera_index=2)
-    wait_for(coordinator, job["job_id"], {"reviewing"})
-    coordinator.cancel(job["job_id"])
+    job = coordinator.start_scan(source="automatic", camera_index=2, eye_camera_index=1)
+    assert job["status"] in {"waiting_for_eye_camera", "opening_camera"}
     result = wait_for(coordinator, job["job_id"])
-    assert result["status"] == "cancelled"
-    assert "result" not in result
+    assert result["status"] == "captured"
+    assert result["result"] == captured_image()
+    assert "settle_seconds" not in result
+    assert "reservation_expires_at" not in result
 
 
-def test_browser_capture_and_framing_cancellation(coordinator_factory):
-    coordinator = coordinator_factory(worker=framing_worker)
-    job = coordinator.enqueue(camera_index=2)
-    wait_for(coordinator, job["job_id"], {"framing"})
-    coordinator.capture(job["job_id"])
-    assert wait_for(coordinator, job["job_id"])["status"] == "accepted"
-    next_job = coordinator.enqueue(camera_index=2)
-    wait_for(coordinator, next_job["job_id"], {"framing"})
-    coordinator.cancel(next_job["job_id"])
-    assert wait_for(coordinator, next_job["job_id"])["status"] == "cancelled"
+def test_capture_releases_tracker_and_next_camera_before_ocr(coordinator_factory):
+    tracker = Tracker()
+    coordinator = coordinator_factory(tracker_settings_store=tracker)
+    first = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, first["job_id"], {"captured"})
+    assert tracker.paused is None
+    assert tracker.released == [first["job_id"]]
+    second = coordinator.start_scan(camera_index=3)
+    assert second["job_id"] != first["job_id"]
+    wait_for(coordinator, second["job_id"], {"captured"})
+    assert coordinator.get(first["job_id"])["status"] == "captured"
+    assert tracker.released == [first["job_id"], second["job_id"]]
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"stage_timeouts": {"capturing": 0.1}},
-    {"overall_timeout": 0.3},
-])
-def test_deadlines_recover_a_blocked_worker(coordinator_factory, kwargs):
-    coordinator = coordinator_factory(worker=blocked_worker, **kwargs)
-    job = coordinator.enqueue(camera_index=2)
-    assert wait_for(coordinator, job["job_id"])["status"] == "timed_out"
-    assert coordinator._active is None
+def test_same_camera_index_waits_for_actual_tracker_release(coordinator_factory):
+    released = threading.Event()
+    tracker = Tracker()
+    tracker.camera_pause_released = lambda job_id: released.is_set()
+    coordinator = coordinator_factory(tracker_settings_store=tracker)
+    job = coordinator.start_scan(camera_index=2, eye_camera_index=2)
+    assert job["status"] == "waiting_for_eye_camera"
+    assert coordinator._active["process"] is None
+    released.set()
+    assert wait_for(coordinator, job["job_id"])["status"] == "captured"
+    assert tracker.paused is None
 
 
-def test_expired_reservation_and_cancelled_settling_release_gate(coordinator_factory):
-    coordinator = coordinator_factory(reservation_seconds=0.1)
-    first = coordinator.reserve(trigger_id="expired", eye_camera_index=1,
-                                camera_index=None, settle_seconds=0)
-    assert wait_for(coordinator, first["job_id"])["status"] == "timed_out"
-    assert coordinator.commit(first["job_id"])["status"] == "timed_out"
-    second = coordinator.reserve(trigger_id="settling", eye_camera_index=1,
-                                 camera_index=None, settle_seconds=1)
-    coordinator.commit(second["job_id"])
-    wait_for(coordinator, second["job_id"], {"settling"})
-    coordinator.cancel(second["job_id"])
-    assert wait_for(coordinator, second["job_id"])["status"] == "cancelled"
-    third = coordinator.reserve(trigger_id="no-ocr", eye_camera_index=1,
-                                camera_index=None, settle_seconds=0)
-    coordinator.commit(third["job_id"])
-    result = wait_for(coordinator, third["job_id"])
-    assert result["status"] == "accepted"
-    assert "result" not in result
-
-
-def test_cancelled_reserve_holds_gate_through_dispatch_lease_and_settling(coordinator_factory):
-    coordinator = coordinator_factory(reservation_seconds=0.2)
-    started = time.monotonic()
-    job = coordinator.reserve(trigger_id="cancel-before-delivery", eye_camera_index=1,
-                              camera_index=None, settle_seconds=0.2)
-    assert coordinator.cancel(job["job_id"])["status"] == "cancelling"
-    # A tracker can still receive the original reservation response during its lease.
-    assert coordinator.commit(job["job_id"])["status"] == "cancelling"
-    time.sleep(0.25)
-    with pytest.raises(ScanBusyError):
-        coordinator.enqueue(camera_index=2)
-    assert wait_for(coordinator, job["job_id"])["status"] == "cancelled"
-    assert time.monotonic() - started >= 0.4
-
-
-def test_cancelled_committed_turn_keeps_physical_settling_guard(coordinator_factory):
+def test_completed_text_is_published_and_rejected_capture_keeps_it(coordinator_factory):
     coordinator = coordinator_factory()
-    job = coordinator.reserve(trigger_id="turn-sent", eye_camera_index=1,
-                              camera_index=None, settle_seconds=0.3)
-    committed_at = time.monotonic()
-    coordinator.commit(job["job_id"])
-    wait_for(coordinator, job["job_id"], {"settling"})
+    first = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, first["job_id"], {"captured"})
+    completed = coordinator.complete(first["job_id"], accepted=True,
+                                     text="Accepted reading text.", reason="readable")
+    assert completed["status"] == "accepted"
+    assert completed["result"]["accepted"] is True
+    previous = coordinator.get(first["job_id"], include_result=True)
+    assert previous["result"]["text"] == "Accepted reading text."
+    second = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, second["job_id"], {"captured"})
+    rejected = coordinator.complete(second["job_id"], accepted=False, text="", reason="blurred")
+    assert rejected["status"] == "rejected"
+    assert rejected["result"]["reason"] == "blurred"
+    assert coordinator.get(first["job_id"], include_result=True) == previous
+
+
+def test_stale_completion_cannot_replace_current_page(coordinator_factory):
+    coordinator = coordinator_factory()
+    first = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, first["job_id"], {"captured"})
+    second = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, second["job_id"], {"captured"})
+    coordinator.complete(second["job_id"], accepted=True, text="Current page.", reason="readable")
+    with pytest.raises(ValueError):
+        coordinator.complete(first["job_id"], accepted=True, text="Old page.", reason="readable")
+    result = coordinator.get(second["job_id"], include_result=True)["result"]
+    assert result["text"] == "Current page."
+
+
+def test_repeated_page_text_is_accepted_without_duplicate_suppression(coordinator_factory):
+    coordinator = coordinator_factory()
+    for _ in range(2):
+        job = coordinator.start_scan(source="automatic", camera_index=2)
+        wait_for(coordinator, job["job_id"], {"captured"})
+        result = coordinator.complete(job["job_id"], accepted=True,
+                                      text="The same words.", reason="readable")
+        assert result["status"] == "accepted"
+
+
+def test_cancel_pending_ocr_prevents_late_acceptance(coordinator_factory):
+    coordinator = coordinator_factory()
+    job = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, job["job_id"], {"captured"})
+    assert coordinator.cancel(job["job_id"])["status"] == "cancelled"
+    with pytest.raises(ValueError):
+        coordinator.complete(job["job_id"], accepted=True, text="Late text.", reason="readable")
+
+
+def test_completed_jobs_are_stable_when_cancelled(coordinator_factory):
+    coordinator = coordinator_factory()
+    job = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, job["job_id"], {"captured"})
+    coordinator.complete(job["job_id"], accepted=True, text="Page.", reason="readable")
+    before = coordinator.get(job["job_id"], include_result=True)
     coordinator.cancel(job["job_id"])
+    assert coordinator.get(job["job_id"], include_result=True) == before
+
+
+def test_cancel_stuck_capture_joins_worker_before_releasing_tracker(coordinator_factory):
+    tracker = Tracker()
+    coordinator = coordinator_factory(worker=blocked_worker, tracker_settings_store=tracker)
+    job = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, job["job_id"], {"capturing"})
+    process = coordinator._active["process"]
+    assert process.is_alive()
+
+    def require_worker_exit():
+        assert not process.is_alive()
+        assert process.exitcode is not None
+
+    tracker.release_check = require_worker_exit
+    assert coordinator.cancel(job["job_id"])["status"] == "cancelling"
+    assert tracker.paused == job["job_id"]
+    assert wait_for(coordinator, job["job_id"], {"cancelled"})["status"] == "cancelled"
+    assert tracker.paused is None
+    assert tracker.released == [job["job_id"]]
+    tracker.release_check = None
+    next_job = coordinator.start_scan(camera_index=2)
+    assert next_job["status"] in {"waiting_for_eye_camera", "opening_camera"}
+
+
+def test_browser_capture_uses_latest_preview_without_expiry(coordinator_factory):
+    coordinator = coordinator_factory(worker=framing_worker)
+    job = coordinator.start_scan(camera_index=2)
+    wait_for(coordinator, job["job_id"], {"framing"})
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        preview = coordinator.preview(job["job_id"])
+        if preview["frame"] and preview["frame"]["captured_at"] == 2.0:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("Latest framing image was not published.")
+    assert preview["frame"]["data_url"].endswith("last")
     with pytest.raises(ScanBusyError):
-        coordinator.enqueue(camera_index=2)
-    assert wait_for(coordinator, job["job_id"])["status"] == "cancelled"
-    assert time.monotonic() - committed_at >= 0.3
+        coordinator.start_scan(camera_index=2)
+    coordinator.capture(job["job_id"])
+    assert wait_for(coordinator, job["job_id"], {"captured"})["status"] == "captured"
 
 
-def test_result_arriving_between_empty_queue_and_worker_exit_is_kept(coordinator_factory):
+def test_worker_failure_is_reported_and_camera_is_released(coordinator_factory):
+    tracker = Tracker()
+    coordinator = coordinator_factory(worker=failing_worker, tracker_settings_store=tracker)
+    job = coordinator.start_scan(camera_index=2)
+    failed = wait_for(coordinator, job["job_id"], {"failed"})
+    assert "Camera failed to open" in failed["message"]
+    assert tracker.paused is None
+    assert "result" not in failed
+
+
+def test_result_queued_during_worker_exit_is_retained(coordinator_factory):
     coordinator = coordinator_factory()
 
     class Messages(queue.Queue):
         def close(self):
             pass
 
+        def join_thread(self):
+            pass
+
     class ExitingProcess:
         pid = 1
+        exitcode = 0
 
         def __init__(self, *, args, **kwargs):
             self.messages = args[1]
@@ -241,11 +265,11 @@ def test_result_arriving_between_empty_queue_and_worker_exit_is_kept(coordinator
 
         def is_alive(self):
             if not self.published:
-                self.messages.put({"kind": "result", "result": fake_result()})
+                self.messages.put({"kind": "result", "result": captured_image()})
                 self.published = True
             return False
 
-        def join(self):
+        def join(self, timeout=None):
             pass
 
         def close(self):
@@ -254,383 +278,6 @@ def test_result_arriving_between_empty_queue_and_worker_exit_is_kept(coordinator
     coordinator._context = SimpleNamespace(
         Event=threading.Event, Queue=Messages, Process=ExitingProcess,
     )
-    job = coordinator.enqueue(camera_index=2)
-    result = wait_for(coordinator, job["job_id"])
-    assert result["status"] == "accepted"
-    assert result["result"]["text"] == "A freshly turned page."
-
-
-def test_duplicate_auto_text_keeps_reader_page(coordinator_factory):
-    coordinator = coordinator_factory()
-    for expected in ("accepted", "unchanged"):
-        job = coordinator.enqueue(source="automatic", camera_index=2, eye_camera_index=1)
-        assert wait_for(coordinator, job["job_id"])["status"] == expected
-
-
-def test_api_aliases_share_lock_and_keep_specific_results(monkeypatch, coordinator_factory):
-    coordinator = coordinator_factory(worker=framing_worker)
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
-    response = client.post("/v1/scan-camera", json={"camera_index": 2})
-    assert response.status_code == 202
-    job_id = response.json()["job_id"]
-    assert client.post("/v1/auto-scans", json={"trigger_id": "auto", "camera_index": 2,
-                                              "eye_camera_index": 1}).status_code == 409
-    assert client.post("/v1/page-turns/reserve", json={"trigger_id": "reserve",
-                       "camera_index": 2, "eye_camera_index": 1}).status_code == 409
-    wait_for(coordinator, job_id, {"framing"})
-    assert client.post(f"/v1/scan-jobs/{job_id}/capture").status_code == 202
-    wait_for(coordinator, job_id)
-    result = client.get(f"/v1/scan-jobs/{job_id}?include_result=true")
-    assert result.json()["result"]["text"] == "A freshly turned page."
-    assert result.headers["cache-control"] == "no-store"
-    assert client.get("/v1/scan-jobs/missing").status_code == 404
-
-
-def test_api_validates_cameras_and_configuration_before_camera_access(monkeypatch):
-    coordinator = ScanJobCoordinator()
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
-    assert client.post("/v1/scan-jobs", json={
-        "camera_index": 2, "source": "automatic",
-    }).status_code == 503
-    response = client.post("/v1/auto-scans", json={"trigger_id": "same-camera",
-                            "camera_index": 1, "eye_camera_index": 1})
-    assert response.status_code == 400
-    assert "different camera" in response.json()["detail"]
-    assert coordinator.latest()["status"] == "idle"
-    coordinator.shutdown()
-
-
-def test_every_busy_api_trigger_is_skipped_and_never_starts_later(
-    monkeypatch, coordinator_factory,
-):
-    coordinator = coordinator_factory(worker=framing_worker)
-    context = coordinator._context
-    launched = []
-
-    def track_process(**kwargs):
-        launched.append(kwargs["args"][0]["source"])
-        return context.Process(**kwargs)
-
-    coordinator._context = SimpleNamespace(
-        Event=context.Event, Queue=context.Queue, Process=track_process,
-    )
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
-    first = client.post("/v1/scan-jobs", json={"camera_index": 2, "source": "manual"})
-    assert first.status_code == 202
-    assert first.json()["status"] == "opening_camera"
-    first_id = first.json()["job_id"]
-    wait_for(coordinator, first_id, {"framing"})
-    attempts = [
-        ("/v1/scan-jobs", {"camera_index": 2, "source": source, "trigger_id": source})
-        for source in ("manual", "test", "automatic")
-    ] + [
-        ("/v1/scan-camera", {"camera_index": 2}),
-        ("/v1/auto-scans", {"camera_index": 2, "eye_camera_index": 1, "trigger_id": "legacy"}),
-        ("/v1/page-turns/reserve", {"camera_index": 2, "eye_camera_index": 1,
-                                   "trigger_id": "turn"}),
-    ]
-    for endpoint, request in attempts:
-        skipped = client.post(endpoint, json=request)
-        assert skipped.status_code == 409
-        assert "skipped" in skipped.json()["detail"]
-        assert "retry-after" not in skipped.headers
-    assert list(coordinator._jobs) == [first_id]
-    coordinator.capture(first_id)
-    assert wait_for(coordinator, first_id)["status"] == "accepted"
-    # Give the monitor several cycles: none of the skipped triggers may replay.
-    time.sleep(0.2)
-    assert launched == ["manual"]
-    assert coordinator._active is None
-    assert coordinator.latest()["job_id"] == first_id
-    assert list(coordinator._jobs) == [first_id]
-    # Only an explicit new request after completion starts the next scan.
-    future = client.post("/v1/scan-jobs", json={"camera_index": 2, "source": "test"})
-    assert future.status_code == 202
-    future_id = future.json()["job_id"]
-    wait_for(coordinator, future_id, {"framing"})
-    assert launched == ["manual", "test"]
-    coordinator.capture(future_id)
-    assert wait_for(coordinator, future_id)["status"] == "unchanged"
-
-
-def test_admission_does_not_wait_behind_a_locked_completion(coordinator_factory):
-    coordinator = coordinator_factory()
-    locked = threading.Event()
-    release = threading.Event()
-
-    def finish_with_lock():
-        with coordinator._lock:
-            locked.set()
-            release.wait(2)
-
-    thread = threading.Thread(target=finish_with_lock)
-    thread.start()
-    assert locked.wait(1)
-    started = time.monotonic()
-    try:
-        with pytest.raises(ScanBusyError, match="skipped"):
-            coordinator.start_scan(camera_index=2)
-        with pytest.raises(ScanBusyError, match="skipped"):
-            coordinator.reserve(trigger_id="busy-lock", eye_camera_index=1, camera_index=2)
-        assert time.monotonic() - started < 0.5
-    finally:
-        release.set()
-        thread.join(2)
-    assert coordinator.latest()["status"] == "idle"
-
-
-def test_simultaneous_scan_sources_admit_exactly_one(coordinator_factory):
-    coordinator = coordinator_factory(worker=framing_worker)
-    barrier = threading.Barrier(3)
-    accepted = []
-    skipped = []
-
-    def trigger(source):
-        barrier.wait()
-        try:
-            accepted.append(coordinator.start_scan(source=source, camera_index=2))
-        except ScanBusyError:
-            skipped.append(source)
-
-    threads = [threading.Thread(target=trigger, args=(source,))
-               for source in ("manual", "test", "automatic")]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(2)
-    assert len(accepted) == 1
-    assert len(skipped) == 2
-    assert len(coordinator._jobs) == 1
-    coordinator.cancel(accepted[0]["job_id"])
-    wait_for(coordinator, accepted[0]["job_id"])
-
-
-def test_page_turn_waits_eight_seconds_from_commit_before_any_camera_worker(
-    monkeypatch, coordinator_factory,
-):
-    monkeypatch.setattr(scan_jobs_module, "MIN_PAGE_SETTLE_SECONDS", 8.0)
-    tick = [100.0]
-    coordinator = coordinator_factory(clock=lambda: tick[0])
-    context = coordinator._context
-    launched_at = []
-    launched = threading.Event()
-
-    def track_process(**kwargs):
-        launched_at.append(tick[0])
-        launched.set()
-        return context.Process(**kwargs)
-
-    coordinator._context = SimpleNamespace(
-        Event=context.Event, Queue=context.Queue, Process=track_process,
-    )
-    reserved = coordinator.reserve(
-        trigger_id="old-client", eye_camera_index=1, camera_index=2, settle_seconds=1.5,
-    )
-    assert reserved["settle_seconds"] == 8
-    assert reserved["status"] == "reserved"
-    assert "scan_starts_at" not in reserved
-    # Serial dispatch takes four seconds; reservation time must not count toward settling.
-    tick[0] = 104
-    before_commit = time.time()
-    committed = coordinator.commit(reserved["job_id"])
-    assert committed["status"] == "settling"
-    assert before_commit + 8 <= committed["scan_starts_at"] <= time.time() + 8
-    assert coordinator.commit(reserved["job_id"])["scan_starts_at"] == committed["scan_starts_at"]
-    for source in ("manual", "test", "automatic"):
-        with pytest.raises(ScanBusyError, match="skipped"):
-            coordinator.start_scan(source=source, camera_index=2)
-    with pytest.raises(ScanBusyError, match="skipped"):
-        coordinator.reserve(trigger_id="extra-turn", eye_camera_index=1, camera_index=2)
-    tick[0] = 108  # Eight seconds after reservation is still only four after commit.
-    assert not launched.wait(0.12)
-    tick[0] = 111.999
-    assert not launched.wait(0.12)
-    assert coordinator.get(reserved["job_id"])["status"] == "settling"
-    tick[0] = 112
-    assert launched.wait(2)
-    assert launched_at == [112]
-    completed = wait_for(coordinator, reserved["job_id"])
-    assert completed["status"] == "accepted"
-    assert "scan_starts_at" not in completed
-    time.sleep(0.12)
-    assert launched_at == [112]  # Busy triggers were discarded, not replayed.
-    future = coordinator.start_scan(source="manual", camera_index=2)
-    assert future["settle_seconds"] == 0
-    assert future["status"] == "opening_camera"
-    assert "scan_starts_at" not in future
-    assert wait_for(coordinator, future["job_id"])["status"] == "accepted"
-    assert launched_at == [112, 112]
-
-
-@pytest.mark.parametrize("endpoint,body,expected,status", [
-    ("/v1/scan-jobs", {"source": "automatic", "settle_seconds": 1.5}, 8, "settling"),
-    ("/v1/scan-jobs", {"source": "test"}, 8, "settling"),
-    ("/v1/auto-scans", {"trigger_id": "legacy", "settle_seconds": 1.5}, 8, "settling"),
-    ("/v1/auto-scans", {"trigger_id": "default"}, 8, "settling"),
-    ("/v1/page-turns/reserve", {"trigger_id": "turn", "settle_seconds": 1.5}, 8, "reserved"),
-    ("/v1/scan-jobs", {"source": "automatic", "settle_seconds": 30}, 30, "settling"),
-    ("/v1/scan-jobs", {"source": "manual", "settle_seconds": 8}, 0, "opening_camera"),
-    ("/v1/scan-camera", {"show_preview": True}, 0, "opening_camera"),
-    ("/v1/scan-camera", {"show_preview": False}, 8, "settling"),
-])
-def test_api_enforces_post_turn_minimum_but_manual_capture_starts_immediately(
-    monkeypatch, coordinator_factory, endpoint, body, expected, status,
-):
-    monkeypatch.setattr(scan_jobs_module, "MIN_PAGE_SETTLE_SECONDS", 8.0)
-    tick = [100.0]
-    coordinator = coordinator_factory(clock=lambda: tick[0])
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
-    response = client.post(endpoint, json={"camera_index": 2, "eye_camera_index": 1, **body})
-    assert response.status_code == 202
-    job = response.json()
-    assert job["status"] == status
-    assert job["settle_seconds"] == expected
-    assert ("scan_starts_at" in job) is (status == "settling")
-    coordinator.cancel(job["job_id"])
-    # Expire the cancellation safety guard without running a camera/provider.
-    tick[0] = 140
-    assert wait_for(coordinator, job["job_id"])["status"] == "cancelled"
-
-
-def wait_for_preview(coordinator, job_id):
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        preview = coordinator.preview(job_id)
-        if preview["frame"] is not None:
-            return preview
-        time.sleep(0.02)
-    raise AssertionError("Worker did not publish a live preview.")
-
-
-def test_live_preview_is_separate_fresh_read_only_and_clears_on_capture(
-    monkeypatch, coordinator_factory,
-):
-    tick = [100.0]
-    coordinator = coordinator_factory(worker=preview_worker, clock=lambda: tick[0])
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
     job = coordinator.start_scan(camera_index=2)
-    job_id = job["job_id"]
-    live = wait_for_preview(coordinator, job_id)
-    runtime = coordinator._active
-    process_id = runtime["process"].pid
-    assert live["frame"]["width"] == 640
-    assert "data_url" not in json.dumps(coordinator.latest())
-    assert "data_url" not in json.dumps(coordinator.get(job_id, include_result=True))
-    for _ in range(3):
-        response = client.get(f"/v1/scan-jobs/{job_id}/preview")
-        assert response.status_code == 200
-        assert response.headers["cache-control"] == "no-store"
-        assert response.json() == live
-    assert coordinator._active is runtime
-    assert runtime["process"].pid == process_id
-    assert len(coordinator._jobs) == 1
-    tick[0] = 102.01
-    assert client.get(f"/v1/scan-jobs/{job_id}/preview").json()["frame"] is None
-    coordinator.capture(job_id)
-    assert wait_for(coordinator, job_id)["status"] == "accepted"
-    assert runtime["preview_frame"] is None
-    assert coordinator.preview(job_id)["frame"] is None
-    assert client.get("/v1/scan-jobs/missing/preview").status_code == 404
-
-
-def test_preview_cancel_and_later_job_never_reveal_an_old_frame(coordinator_factory):
-    coordinator = coordinator_factory(worker=preview_worker)
-    first = coordinator.start_scan(camera_index=2)
-    wait_for_preview(coordinator, first["job_id"])
-    coordinator.cancel(first["job_id"])
-    assert coordinator.preview(first["job_id"])["frame"] is None
-    wait_for(coordinator, first["job_id"])
-    second = coordinator.start_scan(camera_index=3)
-    wait_for_preview(coordinator, second["job_id"])
-    assert coordinator.preview(second["job_id"])["camera_index"] == 3
-    old = coordinator.preview(first["job_id"])
-    assert old["camera_index"] == 2
-    assert old["frame"] is None
-    coordinator.cancel(second["job_id"])
-    wait_for(coordinator, second["job_id"])
-
-
-def test_preview_bounds_and_frozen_frames_cannot_extend_freshness(coordinator_factory):
-    tick = [100.0]
-    coordinator = coordinator_factory(worker=preview_worker, clock=lambda: tick[0])
-    job = coordinator.start_scan(camera_index=2)
-    live = wait_for_preview(coordinator, job["job_id"])
-    runtime = coordinator._active
-    frame = live["frame"]
-    expiry = runtime["preview_expires"]
-    tick[0] = 101
-    invalid_updates = [
-        {"data_url": "data:image/png;base64,abc"},
-        {"data_url": "data:image/jpeg;base64," + "A" * scan_jobs_module.MAX_PREVIEW_DATA_BYTES},
-        {"width": 961}, {"height": True},
-        {"captured_at": time.time() - 5}, {"captured_at": time.time() + 5},
-        {"captured_at": float("nan")}, {"captured_at": 10**400},
-    ]
-    with coordinator._lock:
-        for update in invalid_updates:
-            coordinator._store_preview(runtime, {**frame, **update})
-        coordinator._store_preview(runtime, frame)  # Same capture cannot reset its deadline.
-    assert runtime["preview_frame"] == frame
-    assert runtime["preview_expires"] == expiry
-    tick[0] = 102.01
-    assert coordinator.preview(job["job_id"])["frame"] is None
-    coordinator.cancel(job["job_id"])
-    wait_for(coordinator, job["job_id"])
-
-
-def test_manual_live_preview_can_start_without_provider_keys_but_turns_cannot(monkeypatch):
-    coordinator = ScanJobCoordinator(worker=preview_worker)
-    monkeypatch.setattr(main, "scan_job_coordinator", coordinator)
-    client = TestClient(main.app)
-    try:
-        response = client.post("/v1/scan-jobs", json={"source": "manual", "camera_index": 2})
-        assert response.status_code == 202
-        job_id = response.json()["job_id"]
-        wait_for_preview(coordinator, job_id)
-        coordinator.cancel(job_id)
-        wait_for(coordinator, job_id)
-        automatic = client.post("/v1/page-turns/reserve", json={
-            "trigger_id": "no-key", "eye_camera_index": 1, "camera_index": 2,
-        })
-        assert automatic.status_code == 503
-    finally:
-        coordinator.shutdown()
-
-
-def test_worker_drops_preview_frames_when_channel_is_full_without_blocking_ocr(monkeypatch):
-    from app.services import book_scanner
-    from app.services.scan_worker import run_scan_worker
-
-    class FullFrameChannel:
-        def __init__(self):
-            self.dropped = 0
-            self.control_messages = []
-
-        def put_nowait(self, message):
-            assert message["kind"] == "frame"
-            self.dropped += 1
-            raise queue.Full()
-
-        def put(self, message):
-            self.control_messages.append(message)
-
-    def fake_scan(camera_index, **options):
-        assert camera_index == 2
-        assert options["show_preview"] is True
-        options["progress"]("framing", "Frame the page.")
-        for _ in range(10):
-            options["frame_callback"]({"data_url": "data:image/jpeg;base64,/9j/2Q=="})
-        return fake_result()
-
-    channel = FullFrameChannel()
-    monkeypatch.setattr(book_scanner, "scan_camera", fake_scan)
-    run_scan_worker({"camera_index": 2, "source": "manual", "openai_api_key": "",
-                     "openai_model": "", "openai_revision_model": ""},
-                    channel, threading.Event(), threading.Event())
-    assert channel.dropped == 10
-    assert [message["kind"] for message in channel.control_messages] == ["progress", "result"]
+    result = wait_for(coordinator, job["job_id"], {"captured"})
+    assert result["result"] == captured_image()

@@ -59,3 +59,23 @@ def test_changed_setting_rejects_old_ack_and_new_api_starts_with_gaze_gate():
     fresh_api = module.TrackerSettingsStore().snapshot()
     assert fresh_api["blink_only"] is False
     assert fresh_api["revision"] != changed["revision"]
+
+
+def test_camera_handoff_waits_for_actual_release_not_heartbeat_expiry():
+    tick = [0.0]
+    store = module.TrackerSettingsStore(clock=lambda: tick[0])
+    desired = store.snapshot()
+    acknowledgement = {
+        "revision": desired["revision"], "blink_only": False,
+        "tracker_session_id": "one", "eye_camera_index": 1,
+    }
+    store.acknowledge(**acknowledgement, eye_camera_state="open")
+    store.request_camera_pause("capture-one")
+    assert not store.camera_pause_released("capture-one")
+    tick[0] = 100
+    assert not store.snapshot()["tracker_connected"]
+    assert not store.camera_pause_released("capture-one")
+    store.acknowledge(**acknowledgement, eye_camera_state="released")
+    assert store.camera_pause_released("capture-one")
+    store.clear_camera_pause("capture-one")
+    assert store.snapshot()["camera_pause_job_id"] is None

@@ -85,10 +85,10 @@ def test_calibrated_measurements_emit_once_only_after_third_blink(sensitivity, b
     third = next(snapshot for snapshot in pipeline.snapshots if snapshot.blink_count == 3)
     assert third.display_mode == "SIGNAL" and third.blink_recorded
 
-    # Three more physical closure/reopen patterns during the guard add no turns.
+    # Blink-only mode admits the next gesture immediately. Gaze mode returns to STOP.
     for _ in range(3):
         pipeline.blink()
-    assert pipeline.commands == ["flip right"]
+    assert pipeline.commands == ["flip right"] * (2 if blink_only else 1)
 
 
 def test_normal_mode_needs_gaze_but_blink_only_needs_no_camera_gaze():

@@ -386,11 +386,6 @@ p,h1,h2,h3 {
   margin: 0;
 }
 
-.word-count {
-  font-family: var(--font-mono),monospace;
-  color: #111111;
-  font-size: 10px;
-}
 
 .story-text {
   flex: 1;
@@ -425,17 +420,9 @@ p,h1,h2,h3 {
   background: #b7c69122;
 }
 
-.story-paragraph.active {
-  background: #b7c69166;
-}
 
-.story-paragraph mark {
-  background: #b7c691b8;
-  color: inherit;
-  box-shadow: 3px 0 #b7c691b8,-2px 0 #b7c691b8;
-}
 
-.narration-actions,.sound-settings {
+.conversation-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -478,88 +465,6 @@ p,h1,h2,h3 {
 
 .text-button:hover {
   color: #36492a;
-}
-
-.sound-settings {
-  margin-top: 13px;
-  flex-wrap: wrap;
-  gap: 9px;
-}
-
-.immersive-toggle {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: #686954;
-  font-size: 11px;
-  cursor: pointer;
-  position: relative;
-}
-
-.immersive-toggle input {
-  position: absolute;
-  opacity: 0;
-  width: 29px;
-  height: 18px;
-}
-
-.toggle-track {
-  position: relative;
-  width: 27px;
-  height: 15px;
-  border-radius: 10px;
-  background: #b3b19b;
-  border: 1px solid #99987f;
-  transition: background .2s;
-}
-
-.toggle-track::after {
-  content: "";
-  position: absolute;
-  height: 9px;
-  width: 9px;
-  border-radius: 50%;
-  left: 2px;
-  top: 2px;
-  background: #f8f4df;
-  transition: transform .2s;
-}
-
-.immersive-toggle input:checked+.toggle-track {
-  background: #81975e;
-  border-color: #71874f;
-}
-
-.immersive-toggle input:checked+.toggle-track::after {
-  transform: translateX(12px);
-}
-
-.immersive-toggle input:focus-visible+.toggle-track {
-  outline: 2px solid #47633b;
-  outline-offset: 4px;
-}
-
-.sound-volume {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #74765d;
-}
-
-.sound-volume input {
-  width: 65px;
-  height: 3px;
-  accent-color: #7c9156;
-}
-
-.sound-volume output {
-  width: 29px;
-  font-family: var(--font-mono),monospace;
-  font-size: 9px;
-}
-
-.sound-volume input:disabled {
-  opacity: .35;
 }
 
 .desk-footer {
@@ -1081,8 +986,7 @@ p,h1,h2,h3 {
   box-shadow: none;
 }
 .reader-mic.recording { background-color: #a4483712; }
-.wake-button { font-size: 11px; min-height: 32px; padding: 6px 9px; color: var(--green); }
-.wake-button.listening { color: #405630; border-color: var(--green); background: #d8e2b71c; }
+.conversation-button { font-size: 11px; min-height: 32px; padding: 6px 9px; color: var(--green); }
 .reader-composer {
   display: flex;
   align-items: center;
@@ -1156,37 +1060,6 @@ p,h1,h2,h3 {
   margin: 0 0 22px;
 }
 .story-paragraph:hover { background: transparent; }
-.story-paragraph.active { background: #f1d66038; }
-.story-paragraph mark {
-  background: #eed76cbb;
-  box-shadow: 2px 0 #eed76cbb, -2px 0 #eed76cbb;
-  box-decoration-break: clone;
-}
-
-.word-note {
-  position: relative;
-  width: min(250px, 90%);
-  height: 245px;
-  margin: 28px 5px 12px auto;
-  transform: rotate(1.5deg);
-}
-.word-note > img { pointer-events: none; }
-.word-note-content {
-  position: absolute;
-  inset: 37px 27px 35px;
-  overflow-y: auto;
-  scrollbar-width: none;
-  color: var(--blue-ink);
-  font: 16px/1.6 var(--font-hand), cursive;
-}
-.word-note-content h2 {
-  margin: 0 0 9px;
-  color: #914b36;
-  font: inherit;
-  text-decoration: underline;
-  text-underline-offset: 4px;
-}
-.word-note-content p { margin: 0; }
 
 /* Appendix: compact diagnostics and manual controls stay on the paper. */
 .developer-page { font-family: var(--font-sans), Arial, sans-serif; }
@@ -1227,8 +1100,6 @@ p,h1,h2,h3 {
 .scan-preview { margin: 0; }
 .scan-photo { position: relative; width: fit-content; max-width: 100%; margin: 0 auto; }
 .scan-photo-image { display: block; width: auto; max-width: 100%; height: auto; max-height: 240px; border-radius: 3px; }
-.scan-word-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.scan-word-box { color: #285c9c; }
 .scan-photo-empty { display: grid; place-items: center; height: 132px; border: 1px dashed #96917a; border-radius: 3px; color: #79715c; font-size: 11px; background: #60583b08; }
 .developer-scan-controls { flex-wrap: wrap; justify-content: flex-end; }
 .live-camera-preview { margin: 14px 0; }
@@ -1241,13 +1112,11 @@ p,h1,h2,h3 {
 .reader-tools h3 { font: 500 11px/1.4 var(--font-sans), Arial, sans-serif; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 12px; }
 .command-log h3 { font: 500 11px/1.4 var(--font-mono), monospace; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 12px; }
 .reader-tools .notebook-button, .reader-tools .text-button { font-size: 10px; padding: 6px 9px; }
-.reader-tools .sound-settings { margin-top: 10px; }
-.reader-tools .immersive-toggle { font-size: 10px; }
 .developer-composer { display: flex; align-items: center; margin-top: 14px; border: 0; border-radius: 2px; gap: 5px; background: #fffaf122; }
 .developer-composer input { flex: 1; min-width: 0; width: 100%; background: none; border: 0; font: 11px var(--font-mono), monospace; color: var(--blue-ink); height: 36px; }
 .developer-composer input::placeholder { color: #7c755f; }
 .developer-composer .icon-button { width: 32px; height: 32px; border: 0; border-radius: 2px; box-shadow: none; background-size: 165% 165%; }
-.tool-status, .narration-moods { font-size: 10px; line-height: 1.6; color: #71674e; margin: 9px 0 0; overflow-wrap: anywhere; }
+.tool-status { font-size: 10px; line-height: 1.6; color: #71674e; margin: 9px 0 0; overflow-wrap: anywhere; }
 .tool-status.is-error { color: #914333; }
 .command-log { margin-top: 20px; min-height: 70px; }
 .command-events { max-height: 180px; }
@@ -1255,7 +1124,6 @@ p,h1,h2,h3 {
 
 /* UI labels use Google Sans Flex; the command log keeps its terminal-style mono face. */
 .story-heading,
-.story-heading .word-count,
 .story-page .page-footer,
 .journal-page .page-heading,
 .journal-page .journal-heading,
@@ -1263,7 +1131,6 @@ p,h1,h2,h3 {
 .developer-page .gaze-label,
 .developer-page .diagnostic-metrics dd,
 .developer-page .scan-reason,
-.developer-page .sound-volume output,
 .developer-page .developer-composer input {
   font-family: var(--font-sans), Arial, sans-serif;
 }
@@ -1283,9 +1150,6 @@ p,h1,h2,h3 {
 .reader-tools,
 .reader-tools h3,
 .reader-tools .text-button,
-.reader-tools .immersive-toggle,
-.reader-tools .sound-volume,
-.reader-tools .sound-volume output,
 .developer-composer input,
 .developer-composer input::placeholder,
 .command-log,
@@ -1305,7 +1169,6 @@ p,h1,h2,h3 {
   .story-text { max-height: none; overflow: visible; }
   .journal-entry { font-size: 17px; }
   .journal-heading { font-size: 17px; }
-  .word-note { margin-right: 0; }
 }
 
 @media (max-width:760px) {

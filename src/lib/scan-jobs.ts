@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
-import { createScanJob, getScanJob, latestScanJob, LoobError, scanIsActive, scanJobAction, type ScanJob } from "@/lib/api";
+import { createScanJob, getScanJob, latestScanJob, scanIsActive, scanJobAction, type ScanJob } from "@/lib/api";
 
 export function useScanJobs(onComplete: (job: ScanJob) => void) {
   const [job, setJob] = useState<ScanJob | null>(null);
@@ -9,7 +9,6 @@ export function useScanJobs(onComplete: (job: ScanJob) => void) {
   const [error, setError] = useState<string | null>(null);
   const [action, setAction] = useState<"starting" | "capture" | "cancel" | null>(null);
   const working = useRef(false);
-  const scannerActive = useRef(false);
   const generation = useRef(0);
   const notifyComplete = useEffectEvent(onComplete);
 
@@ -17,33 +16,31 @@ export function useScanJobs(onComplete: (job: ScanJob) => void) {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     const request = new AbortController();
-    // Retain only the current result; no camera images in subsequent status polls.
-    let completed: ScanJob | null = null;
-    const delivered = new Set<string>();
+    let result: ScanJob | null = null;
+    let delivered: string | null = null;
     async function poll() {
       const version = generation.current;
       let delay = 1_000;
       try {
         let next = await latestScanJob(request.signal);
         if (next.job_id && !scanIsActive(next)) {
-          if (completed?.job_id !== next.job_id) {
-            const result = await getScanJob(next.job_id, request.signal);
+          if (result?.job_id === next.job_id && result.status === next.status) {
+            next = result;
+          } else {
+            const full = await getScanJob(next.job_id, request.signal);
             const latest = await latestScanJob(request.signal);
-            // A more recent capture takes precedence over an older result.
-            next = latest.job_id === result.job_id ? result : latest;
-            // A terminal summary for a different job still needs its own result fetch.
-            if (next.job_id === result.job_id && !scanIsActive(result)) completed = result;
-          } else next = completed;
+            next = latest.job_id === full.job_id && latest.status === full.status ? full : latest;
+            if (next === full) result = full;
+          }
         }
         if (!stopped && !working.current && version === generation.current) {
-          scannerActive.current = scanIsActive(next);
           setJob(next);
           setConnected(true);
           setError(null);
-          if (next.job_id && completed?.job_id === next.job_id && !scanIsActive(next) && !delivered.has(next.job_id)) {
+          const key = `${next.job_id}:${next.status}`;
+          if (next.job_id && !scanIsActive(next) && delivered !== key && result === next) {
+            delivered = key;
             notifyComplete(next);
-            delivered.add(next.job_id);
-            if (delivered.size > 64) delivered.delete(delivered.values().next().value!);
           }
         }
         delay = scanIsActive(next) ? 500 : 1_000;
@@ -62,8 +59,7 @@ export function useScanJobs(onComplete: (job: ScanJob) => void) {
   }, []);
 
   const run = useCallback(async (kind: "starting" | "capture" | "cancel", perform: () => Promise<ScanJob>) => {
-    // Drop new starts immediately, including calls from an older render. Never replay them.
-    if (working.current || (kind === "starting" && scannerActive.current)) return;
+    if (working.current) return;
     working.current = true;
     generation.current += 1;
     setAction(kind);
@@ -71,20 +67,11 @@ export function useScanJobs(onComplete: (job: ScanJob) => void) {
     try {
       const next = await perform();
       generation.current += 1;
-      scannerActive.current = scanIsActive(next);
       setJob(next);
       setConnected(true);
       return next;
     } catch (failure) {
-      if (kind === "starting" && failure instanceof LoobError && failure.status === 409) {
-        // Another client/real blink won the scan slot. Poll its progress without retrying.
-        scannerActive.current = true;
-        setConnected(true);
-        return;
-      }
-      const message = failure instanceof Error ? failure.message : "Scan request failed.";
-      setError(message);
-      if (!(failure instanceof LoobError) || !failure.status) setConnected(false);
+      setError(failure instanceof Error ? failure.message : "Scan request failed.");
       throw failure;
     } finally {
       working.current = false;

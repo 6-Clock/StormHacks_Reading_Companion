@@ -37,8 +37,6 @@ class TrackerSettingsStore:
         self._eye_camera: int | None = None
         self._eye_camera_state: EyeCameraState = "released"
         self._camera_pause_job_id: str | None = None
-        self._camera_pause_required_session: str | None = None
-        self._camera_pause_release_seen = False
         self._last_ack: float | None = None
         self._diagnostics: dict | None = None
         self._diagnostics_sequence = 0
@@ -74,26 +72,17 @@ class TrackerSettingsStore:
             return self._snapshot()
 
     def request_camera_pause(self, job_id: str) -> None:
-        """Keep the eye camera paused until this exact job finishes cleanup."""
+        """Pause the eye camera while the capture worker owns it."""
         with self._lock:
             if self._camera_pause_job_id not in (None, job_id):
                 raise RuntimeError("Another camera handoff is active.")
-            if self._camera_pause_job_id == job_id:
-                return
             self._camera_pause_job_id = job_id
-            # Retain ownership evidence even after heartbeat expiry. An older
-            # tracker may ignore pauses and may not yet use the OS camera lease.
-            self._camera_pause_required_session = self._session
-            self._camera_pause_release_seen = (
-                self._session is None or self._eye_camera_state == "released"
-            )
 
     def camera_pause_released(self, job_id: str) -> bool:
-        """A stale heartbeat must never stand in for an explicit camera release."""
+        """The camera owner reports release after its read thread exits."""
         with self._lock:
             return (
                 self._camera_pause_job_id == job_id
-                and self._camera_pause_release_seen
                 and (self._session is None or self._eye_camera_state == "released")
             )
 
@@ -101,8 +90,6 @@ class TrackerSettingsStore:
         with self._lock:
             if self._camera_pause_job_id == job_id:
                 self._camera_pause_job_id = None
-                self._camera_pause_required_session = None
-                self._camera_pause_release_seen = False
 
     def acknowledge(
         self, *, revision: str, blink_only: bool, tracker_session_id: str, eye_camera_index: int,
@@ -126,11 +113,6 @@ class TrackerSettingsStore:
             self._session = tracker_session_id
             self._eye_camera = eye_camera_index
             self._eye_camera_state = eye_camera_state
-            if self._camera_pause_job_id is not None:
-                if self._camera_pause_required_session is None:
-                    self._camera_pause_required_session = tracker_session_id
-                if self._camera_pause_required_session == tracker_session_id:
-                    self._camera_pause_release_seen = eye_camera_state == "released"
             self._last_ack = self._clock()
             return self._snapshot()
 

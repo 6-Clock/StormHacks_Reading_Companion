@@ -1,46 +1,26 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { type FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Image from "next/image";
-import { ask, LoobError, makeSpeech, planNarration, transcribe, type CameraScan, type NarrationMood, type NarrationPlan, type StoryEffect } from "@/lib/api";
-import { AmbientSound } from "@/lib/ambient";
+import { completeScanResult, createScanJob, getScanJob, scanJobAction, type ScanJob } from "@/lib/api";
+import { useVoiceSession } from "@/lib/voice-session";
+import { groupTranscriptFragments } from "@/lib/reading-journal";
 import { DeskIcon } from "@/components/DeskIcon";
-import { DeveloperPanel } from "@/components/DeveloperPanel";
+import { DeveloperPanel, type ScanSnapshot } from "@/components/DeveloperPanel";
 import { useEyeDiagnostics } from "@/lib/diagnostics";
 import { useScanJobs } from "@/lib/scan-jobs";
 import { useTrackerSettings } from "@/lib/tracker-settings";
-import { countAskedWords, findAskedTerm } from "@/lib/reading-journal";
 import notebook from "@/assets/blank note.png";
 import bookmark from "@/assets/bookmark_with_no_wrinkle.png";
-import stickyNote from "@/assets/postit yellow png.png";
 import loobSymbol from "@/assets/loob-logo-symbol.svg";
 
-type Message = { id: number; role: "user" | "assistant" | "notice" | "error"; text: string; voice?: boolean };
 type DeskEvent = { id: string; time: number; type: string; message: string };
-type WakeRecognitionEvent = {
-  results: { length: number; [index: number]: { 0?: { transcript?: string } } };
-};
-type WakeRecognition = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((event: WakeRecognitionEvent) => void) | null;
-  onerror: ((event: { error: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
-type WakeRecognitionConstructor = new () => WakeRecognition;
-
 const initialPassage = [
   "At midnight, Mara stepped into the empty house. Footsteps sounded above her, though no one was supposed to be there. A shadow slid across the stairwell, and a whisper called her name.",
   "She followed the sound to the attic. The door creaked open before she touched it. In the dark, two pale eyes stared from behind a stack of boxes, and Mara held her breath.",
   "A small black cat padded into the moonlight and brushed against her ankle. Mara let out a laugh. The warm glow of a night-light filled the attic, and the house felt safe again.",
-];
-const wakeGreeting = "Hello, I am LOOB. What can I help you with?";
-
-const wait = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+].join("\n\n");
+const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 const sessionDateLabel = () => new Intl.DateTimeFormat("en", { weekday: "short", month: "short", day: "numeric" }).format(new Date());
 const serverDateLabel = () => "Your reading journal";
 function subscribeDate(onChange: () => void) {
@@ -48,708 +28,186 @@ function subscribeDate(onChange: () => void) {
   return () => clearInterval(timer);
 }
 
-function scanError(reason: string) {
-  if (reason.includes("scan_cancelled")) return "Camera calibration was cancelled. The current page was kept.";
-  if (reason.includes("no_camera_frames")) return "The camera did not return a frame. Check that it is connected and try again.";
-  if (reason.includes("openai_request_failed")) return "AI OCR could not reach the configured vision model. Check the Uvicorn terminal for the exact API error and verify OPENAI_OCR_MODEL.";
-  if (reason.includes("invalid_openai_response")) return "The vision model returned an unreadable response. Check the Uvicorn terminal and try a vision-capable OPENAI_OCR_MODEL.";
-  if (reason.includes("openai_revision_rejected")) return "AI OCR found text but could not verify it reliably. Improve focus or lighting and scan again.";
-  if (reason.includes("openai_text_not_plausible")) return "AI OCR could not find enough readable printed text on this page. Center the text and scan again.";
-  if (reason.includes("too_few_confident_words") || reason.includes("non_text")) return "No readable book text was detected. Center the page, improve lighting, and scan again.";
-  if (reason.includes("low_text_confidence")) return "The page is too blurry or dim to read reliably. Refocus the camera and scan again.";
-  return "This scan was not clear enough to use. Reposition the book and try again.";
-}
-
-const spokenCharacter = /[\p{L}\p{N}]/u;
-
-function cleanSpeechText(text: string) {
-  return text
-    .replace(/^[ \t]*[*_#=~\-]{3,}[ \t]*$/gm, " ")
-    .replace(/\*+/g, "")
-    .replace(/`+/g, "")
-    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function speechChunks(text: string) {
-  const chunks: string[] = [];
-  let remaining = cleanSpeechText(text);
-  if (!spokenCharacter.test(remaining)) return chunks;
-  while (remaining.length > 4_500) {
-    const space = remaining.lastIndexOf(" ", 4_500);
-    const end = space > 3_000 ? space : 4_500;
-    chunks.push(remaining.slice(0, end).trim());
-    remaining = remaining.slice(end).trim();
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
-}
-
-function storyParagraphs(text: string) {
-  const blocks = text.trim().split(/\n\s*\n/).map((block) => block.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean);
-  if (blocks.length !== 1 || blocks[0].length <= 450) return blocks;
-
-  // OCR sometimes returns one uninterrupted block. Group sentences so mood can still change.
-  const sentences = blocks[0].match(/[^.!?]+(?:[.!?]+[”"']?)|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [];
-  if (sentences.length < 2) return blocks;
-  const grouped: string[] = [];
-  let current = "";
-  for (const sentence of sentences) {
-    if (current && current.length + sentence.length > 320) {
-      grouped.push(current);
-      current = sentence;
-    } else {
-      current = current ? `${current} ${sentence}` : sentence;
-    }
-  }
-  if (current) grouped.push(current);
-  return grouped;
-}
-
-function wakeRecognitionConstructor() {
-  const browserWindow = window as typeof window & {
-    SpeechRecognition?: WakeRecognitionConstructor;
-    webkitSpeechRecognition?: WakeRecognitionConstructor;
-  };
-  return browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition ?? null;
-}
-
 export function ReadingDesk() {
   const [tab, setTab] = useState<"reader" | "developer">("reader");
-  const [lastScan, setLastScan] = useState<{ result: CameraScan; capturedAt: number; durationMs: number } | null>(null);
+  const [page, setPage] = useState({ id: "sample", text: initialPassage, title: "The Whisper in the Attic" });
+  const [lastScan, setLastScan] = useState<ScanSnapshot | null>(null);
+  const [pendingCapture, setPendingCapture] = useState<ScanJob | null>(null);
+  const [capturedPage, setCapturedPage] = useState<ScanJob | null>(null);
   const [events, setEvents] = useState<DeskEvent[]>([]);
-  const [askedTerms, setAskedTerms] = useState<string[]>([]);
-  const [wordNote, setWordNote] = useState<{ term: string; answer: string } | null>(null);
+  const [toolStatus, setToolStatus] = useState<{ text: string; error: boolean } | null>(null);
+  const [input, setInput] = useState("");
+  const [cameraIndex, setCameraIndex] = useState(2);
+  const [blinkTestCount, setBlinkTestCount] = useState<number | null>(null);
+  const hookOwnedCaptures = useRef(new Set<string>());
+  const waitingCapture = useRef<ScanJob | null>(null);
+  const journalEnd = useRef<HTMLDivElement | null>(null);
   const sessionDate = useSyncExternalStore(subscribeDate, sessionDateLabel, serverDateLabel);
   const diagnostics = useEyeDiagnostics(true);
   const tracker = useTrackerSettings();
-  const scans = useScanJobs((job) => {
-    if (job.result && (job.status === "accepted" || job.status === "rejected" || (job.status === "unchanged" && !pageScanned))) {
-      if (job.result.accepted) stopAudio();
-      applyScanResult(job.result, {
-        capturedAt: (job.completed_at ?? Date.now() / 1_000) * 1_000,
-        durationMs: job.duration_ms ?? 0,
-        automatic: job.source !== "manual",
-      });
-    } else if (["failed", "timed_out", "cancelled", "unchanged"].includes(job.status)) {
-      add({ role: job.status === "failed" || job.status === "timed_out" ? "error" : "notice", text: job.message });
-    }
-  });
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [toolStatus, setToolStatus] = useState<{ text: string; error: boolean } | null>(null);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [micPending, setMicPending] = useState(false);
-  const [wakeListening, setWakeListening] = useState(false);
-  const [speaking, setSpeaking] = useState<number | null>(null);
-  const [pageText, setPageText] = useState(() => initialPassage.join("\n\n"));
-  const [pageTitle, setPageTitle] = useState("The Whisper in the Attic");
-  const [pageScanned, setPageScanned] = useState(false);
-  const [cameraIndex, setCameraIndex] = useState(2);
-  const scanning = scans.active || scans.action !== null;
-  const [blinkTestCount, setBlinkTestCount] = useState<number | null>(null);
-  const [immersive, setImmersive] = useState(false);
-  const [ambientVolume, setAmbientVolume] = useState(60);
-  const [activeParagraph, setActiveParagraph] = useState<number | null>(null);
-  const [pageMoods, setPageMoods] = useState<NarrationMood[] | null>(null);
-  const recorder = useRef<MediaRecorder | null>(null);
-  const micWorking = useRef(false);
-  const wakeRecognition = useRef<WakeRecognition | null>(null);
-  const wakeListeningRef = useRef(false);
-  const wakeGreetingInProgress = useRef(false);
-  const messageSequence = useRef(0);
-  const stream = useRef<MediaStream | null>(null);
-  const audio = useRef<HTMLAudioElement | null>(null);
-  const audioUrl = useRef<string | null>(null);
-  const speechRequest = useRef<AbortController | null>(null);
-  const playbackVersion = useRef(0);
-  const ambience = useRef<AmbientSound | null>(null);
-  const planCache = useRef<{ text: string; plan: NarrationPlan } | null>(null);
-  const speechCache = useRef(new Map<string, Blob>());
-  const journalEnd = useRef<HTMLDivElement | null>(null);
-  const questionInput = useRef<HTMLInputElement | null>(null);
-  const scanControlWorking = useRef(false);
 
   function logEvent(type: string, message: string) {
-    setEvents((current) => [...current, { id: crypto.randomUUID(), time: Date.now() / 1000, type, message }].slice(-60));
+    setEvents((current) => [...current, { id: crypto.randomUUID(), time: Date.now() / 1_000, type, message }].slice(-60));
   }
-
-  function add(message: Omit<Message, "id">) {
-    if (message.role === "notice" || message.role === "error") setToolStatus({ text: message.text, error: message.role === "error" });
-    const id = ++messageSequence.current;
-    setMessages((items) => [...items, { ...message, id }]);
+  function report(error: unknown) {
+    const text = error instanceof Error ? error.message : "The operation failed. Try again.";
+    setToolStatus({ text, error: true });
+    logEvent("error", text);
   }
-
-  function stopAudio() {
-    playbackVersion.current += 1;
-    speechRequest.current?.abort();
-    speechRequest.current = null;
-    audio.current?.pause();
-    if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
-    audio.current = null;
-    audioUrl.current = null;
-    ambience.current?.stop();
-    ambience.current = null;
-    setSpeaking(null);
-    setActiveParagraph(null);
+  function applyScan(job: ScanJob) {
+    if (!job.result) return;
+    setLastScan({ result: job.result, capturedAt: job.result.captured_at * 1_000, durationMs: job.duration_ms ?? 0 });
+    setCapturedPage((current) => current?.job_id === job.job_id ? null : current);
+    if (job.status === "accepted" && job.result.text) {
+      setPage({ id: job.job_id!, text: job.result.text, title: "Scanned book page" });
+      setToolStatus({ text: voice.status === "connected" ? "Page scanned. Ask LOOB about it or read it aloud." : "Page scanned. Start conversation to ask about it or read it aloud.", error: false });
+    } else if (job.status === "rejected") {
+      setToolStatus({ text: `${job.result.reason || "This page was unreadable."} The current page was kept.`, error: true });
+    }
   }
-
-  async function playClip(blobRequest: Promise<Blob>, mood: NarrationMood, controller: AbortController, version: number, useAmbience: boolean, effect?: StoryEffect, onReady?: () => void) {
-    const blob = await blobRequest;
-    if (controller.signal.aborted || playbackVersion.current !== version) return false;
-
-    const url = URL.createObjectURL(blob);
-    const player = new Audio(url);
-    audio.current = player;
-    audioUrl.current = url;
-    if (useAmbience) {
-      ambience.current ??= new AmbientSound();
-      const sound = ambience.current;
-      sound.setVolume(ambientVolume / 100);
+  const eyeCameraIndex = tracker.data?.tracker_connected ? tracker.data.eye_camera_index ?? undefined
+    : diagnostics.data?.connected ? diagnostics.data.camera_index ?? undefined : undefined;
+  const voice = useVoiceSession({
+    pageText: page.text,
+    pageId: page.id,
+    onScanResult: async (jobId, result) => {
+      const completed = await completeScanResult(jobId, { accepted: result.accepted, text: result.text, reason: result.reason });
+      applyScan(completed);
+      hookOwnedCaptures.current.delete(jobId);
+    },
+    capturePage: async (activeJobId, signal) => {
+      signal?.throwIfAborted();
+      if (activeJobId) await scanJobAction(activeJobId, "cancel");
+      signal?.throwIfAborted();
+      let job = await createScanJob(cameraIndex, "test", eyeCameraIndex, signal);
+      if (!job.job_id) throw new Error("The camera did not create a capture.");
+      const captureId = job.job_id;
+      hookOwnedCaptures.current.add(captureId);
       try {
-        await sound.setMood(mood);
-      } catch {
-        sound.stop();
-        if (ambience.current === sound) ambience.current = null;
-      }
-    }
-    if (controller.signal.aborted || playbackVersion.current !== version) {
-      URL.revokeObjectURL(url);
-      return false;
-    }
-    onReady?.();
-
-    return new Promise<boolean>((resolve, reject) => {
-      let finished = false;
-      const finish = (completed: boolean, error?: Error) => {
-        if (finished) return;
-        finished = true;
-        controller.signal.removeEventListener("abort", onAbort);
-        if (audio.current === player) audio.current = null;
-        if (audioUrl.current === url) audioUrl.current = null;
-        URL.revokeObjectURL(url);
-        if (error) reject(error);
-        else resolve(completed);
-      };
-      const onAbort = () => { player.pause(); finish(false); };
-      controller.signal.addEventListener("abort", onAbort, { once: true });
-      player.onended = () => finish(true);
-      player.onerror = () => finish(false, new LoobError("Voice playback failed. Tap to try again."));
-      void player.play().then(() => {
-        if (!finished && useAmbience && effect) ambience.current?.playEffect(effect);
-      }).catch((error: Error) => finish(false, error));
-    });
-  }
-
-  async function play(text: string, id: number) {
-    if (scanning || recording || micWorking.current) return;
-    const spokenText = cleanSpeechText(text);
-    if (!spokenCharacter.test(spokenText)) return;
-    setToolStatus(null);
-    stopAudio();
-    const version = playbackVersion.current;
-    const controller = new AbortController();
-    speechRequest.current = controller;
-    setSpeaking(id);
-    try {
-      await playClip(makeSpeech(spokenText, controller.signal), "neutral", controller, version, false);
-      if (playbackVersion.current === version) stopAudio();
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      if (playbackVersion.current === version) stopAudio();
-      add({ role: "notice", text: error instanceof LoobError ? error.message : "LOOB could not prepare that voice response." });
-    }
-  }
-
-  async function narratePage(startIndex: number, fullPage: boolean) {
-    if (scanning || recording || busy || micWorking.current) return;
-    setToolStatus(null);
-    const paragraphs = storyParagraphs(pageText);
-    if (!paragraphs.length) return;
-    logEvent("narration", `${fullPage ? "Page" : `Paragraph ${startIndex + 1}`} narration · ${immersive ? "immersive" : "regular"}`);
-    stopAudio();
-    const version = playbackVersion.current;
-    const controller = new AbortController();
-    speechRequest.current = controller;
-    setSpeaking(-(startIndex + 1));
-    setActiveParagraph(startIndex);
-    if (immersive) {
-      ambience.current = new AmbientSound();
-      ambience.current.setVolume(ambientVolume / 100);
-      void ambience.current.unlock().catch(() => undefined);
-    }
-
-    try {
-      let moods: NarrationMood[] = paragraphs.map(() => "neutral");
-      let plan: NarrationPlan | null = null;
-      if (immersive) {
-        if (planCache.current?.text === pageText) {
-          plan = planCache.current.plan;
-          moods = plan.moods;
-        } else {
-          try {
-            plan = await planNarration(paragraphs, controller.signal);
-            if (controller.signal.aborted || playbackVersion.current !== version) return;
-            moods = plan.moods;
-            planCache.current = { text: pageText, plan };
-            setPageMoods(moods);
-          } catch {
-            if (controller.signal.aborted || playbackVersion.current !== version) return;
-            add({ role: "notice", text: "Scene sounds are unavailable, so this page will use the regular voice." });
-          }
+        while (!["captured", "cancelled", "failed"].includes(job.status)) {
+          signal?.throwIfAborted();
+          await wait(500);
+          signal?.throwIfAborted();
+          job = await getScanJob(captureId, signal);
         }
+        signal?.throwIfAborted();
+        if (job.status !== "captured") throw new Error(job.message);
+        return job;
+      } catch (error) {
+        hookOwnedCaptures.current.delete(captureId);
+        if (signal?.aborted) await scanJobAction(captureId, "cancel").catch(() => undefined);
+        throw error;
       }
-
-      const end = fullPage ? paragraphs.length : startIndex + 1;
-      const segments: Array<{ text: string; paragraphIndex: number; mood: NarrationMood; effect?: StoryEffect }> = [];
-      for (let paragraphIndex = startIndex; paragraphIndex < end; paragraphIndex++) {
-        const mood = moods[paragraphIndex] ?? "neutral";
-        const cues = plan?.cues.filter((cue) => cue.paragraph_index === paragraphIndex) ?? [];
-        const sentences = plan?.sentences[paragraphIndex];
-        if (!cues.length || !sentences?.length) {
-          speechChunks(paragraphs[paragraphIndex]).forEach((text) => segments.push({ text, paragraphIndex, mood }));
-          continue;
-        }
-
-        const cueBySentence = new Map(cues.map((cue) => [cue.sentence_index, cue.effect]));
-        let pending = "";
-        const flushPending = () => {
-          speechChunks(pending).forEach((text) => segments.push({ text, paragraphIndex, mood }));
-          pending = "";
-        };
-        sentences.forEach((sentence, sentenceIndex) => {
-          const effect = cueBySentence.get(sentenceIndex);
-          if (effect) {
-            flushPending();
-            speechChunks(sentence).forEach((text, chunkIndex) =>
-              segments.push({ text, paragraphIndex, mood, effect: chunkIndex === 0 ? effect : undefined }),
-            );
-          } else {
-            pending = pending ? `${pending} ${sentence}` : sentence;
-          }
-        });
-        flushPending();
+    },
+  });
+  const scans = useScanJobs((job) => {
+    if (job.status === "captured") {
+      setCapturedPage(job);
+      if (job.result) setLastScan({ result: job.result, capturedAt: job.result.captured_at * 1_000, durationMs: job.duration_ms ?? 0 });
+      if (!hookOwnedCaptures.current.has(job.job_id!)) {
+        if (voice.status === "connected") void voice.submitCapturedPage(job).catch(report);
+        else { waitingCapture.current = job; setPendingCapture(job); }
       }
-      const requests = new Map<number, Promise<Blob>>();
-      const requestSegment = (segmentIndex: number) => {
-        if (!requests.has(segmentIndex)) {
-          const segment = segments[segmentIndex];
-          const key = `${segment.mood}\u0000${segment.text}`;
-          const cached = speechCache.current.get(key);
-          const request = cached ? Promise.resolve(cached) : makeSpeech(segment.text, controller.signal, segment.mood).then((blob) => {
-            if (!controller.signal.aborted) {
-              if (speechCache.current.size >= 50) speechCache.current.delete(speechCache.current.keys().next().value!);
-              speechCache.current.set(key, blob);
-            }
-            return blob;
-          });
-          void request.catch(() => undefined);
-          requests.set(segmentIndex, request);
-        }
-        return requests.get(segmentIndex)!;
-      };
-      for (let index = 0; index < segments.length; index++) {
-        if (controller.signal.aborted || playbackVersion.current !== version) return;
-        const segment = segments[index];
-        setSpeaking(-(segment.paragraphIndex + 1));
-        setActiveParagraph(segment.paragraphIndex);
-        const completed = await playClip(requestSegment(index), segment.mood, controller, version, immersive, segment.effect, () => {
-          if (index + 1 < segments.length) requestSegment(index + 1);
-        });
-        if (!completed) return;
-      }
-      if (playbackVersion.current === version) stopAudio();
-    } catch (error) {
-      if (controller.signal.aborted || playbackVersion.current !== version) return;
-      stopAudio();
-      add({ role: "notice", text: error instanceof LoobError ? error.message : "LOOB could not narrate this page." });
+    } else if (job.status === "accepted" || job.status === "rejected") applyScan(job);
+    else setToolStatus({ text: job.message, error: job.status === "failed" });
+  });
+  async function startConversation() {
+    await voice.start();
+    const capture = waitingCapture.current;
+    if (capture) {
+      await voice.submitCapturedPage(capture);
+      waitingCapture.current = null;
+      setPendingCapture(null);
     }
   }
+  async function retryProcessing() {
+    if (!capturedPage) return;
+    await voice.start();
+    await voice.submitCapturedPage(capturedPage);
+    waitingCapture.current = null;
+    setPendingCapture(null);
+  }
+  useEffect(() => {
+    if (tab === "reader") journalEnd.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [voice.fragments, tab]);
 
-  async function submit(question: string, fromMic = false) {
-    const cleaned = question.trim();
-    if (!cleaned || busy || scanning || (!fromMic && micWorking.current)) return;
+  async function scanPage(source: "manual" | "test" = "manual") {
     setToolStatus(null);
-    logEvent("question", fromMic ? "Voice question submitted" : "Reader question submitted");
-    stopAudio();
-    add({ role: "user", text: cleaned, voice: fromMic });
-    const askedTerm = findAskedTerm(cleaned, pageText);
-    if (askedTerm) setAskedTerms((terms) => [...terms, askedTerm]);
-    setInput("");
-    setBusy(true);
     try {
-      const result = await ask(cleaned, pageText);
-      const id = ++messageSequence.current;
-      setMessages((items) => [...items, { id, role: "assistant", text: result.answer }]);
-      if (askedTerm) setWordNote({ term: askedTerm, answer: result.answer });
-      void play(result.answer, id);
-    } catch (error) {
-      add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not answer that question." });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function applyScanResult(result: CameraScan, details: { capturedAt: number; durationMs: number; automatic: boolean }) {
-    if (result.capture_preview || !/scan_cancelled|no_camera_frames/.test(result.reason)) {
-      setLastScan({ result, capturedAt: details.capturedAt, durationMs: details.durationMs });
-    }
-    logEvent(
-      result.accepted ? "success" : "error",
-      result.accepted
-        ? `${details.automatic ? "Automatic " : ""}OCR accepted · ${result.text.trim().split(/\s+/).length} words`
-        : `OCR rejected · ${result.reason}`,
-    );
-    if (!result.accepted) {
-      add({ role: "error", text: scanError(result.reason) });
-      return;
-    }
-    setPageText(result.text);
-    planCache.current = null;
-    speechCache.current.clear();
-    setPageMoods(null);
-    setAskedTerms([]);
-    setWordNote(null);
-    setPageTitle("Scanned book page");
-    setPageScanned(true);
-    const reviewNote = result.openai_revision_status === "requested"
-      ? " with AI transcription and revision"
-      : result.openai_review_status === "requested" ? " with AI vision review" : "";
-    add({
-      role: "notice",
-      text: details.automatic
-        ? `New page scanned automatically${reviewNote}. You can now ask LOOB about it.`
-        : `Page scanned${reviewNote}. You can now ask LOOB about it.`,
-    });
-  }
-  async function scanPage() {
-    if (scanControlWorking.current || scanning || blinkTestCount !== null || busy || recording || micWorking.current) return;
-    scanControlWorking.current = true;
-    setToolStatus(null);
-    stopAudio();
-    try {
-      const eyeCamera = tracker.data?.tracker_connected ? tracker.data.eye_camera_index ?? undefined
-        : diagnostics.data?.connected ? diagnostics.data.camera_index ?? undefined : undefined;
-      const started = await scans.start(cameraIndex, "manual", eyeCamera);
-      if (!started) {
-        const message = "Scan skipped: OCR is still running. Start a new scan after it finishes.";
-        logEvent("scan", message);
-        setToolStatus({ text: message, error: false });
-        return;
+      if (source === "test") {
+        for (const count of [1, 2, 3]) { setBlinkTestCount(count); await wait(220); }
       }
-      logEvent("scan", `Manual OCR requested for camera ${cameraIndex}`);
-    } catch (error) {
-      logEvent("error", error instanceof LoobError ? error.message : "Camera scan failed");
-      add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not scan the camera page." });
-    } finally {
-      scanControlWorking.current = false;
-    }
+      const started = await scans.start(cameraIndex, source, eyeCameraIndex);
+      if (!started) setToolStatus({ text: "Scan skipped: the camera is capturing another page.", error: false });
+      else logEvent("scan", `Camera ${cameraIndex} capture requested`);
+    } catch (error) { report(error); }
+    finally { setBlinkTestCount(null); }
   }
-
-  async function testThreeBlinks() {
-    if (scanControlWorking.current || scanning || blinkTestCount !== null || busy || recording) return;
-    const eyeCameraIndex = tracker.data?.tracker_connected ? tracker.data.eye_camera_index ?? undefined
-      : diagnostics.data?.connected ? diagnostics.data.camera_index ?? undefined : undefined;
-    if (eyeCameraIndex === cameraIndex) {
-      add({ role: "error", text: "Choose different camera indexes for eye tracking and OCR first." });
-      return;
-    }
-    scanControlWorking.current = true;
-    setToolStatus(null);
-    stopAudio();
-    setBlinkTestCount(0);
-    try {
-      for (const count of [1, 2, 3]) {
-        await wait(220);
-        setBlinkTestCount(count);
-        logEvent("blink", `Developer test blink ${count}/3`);
-      }
-      const started = await scans.start(cameraIndex, "test", eyeCameraIndex);
-      if (!started) {
-        const message = "Blink test scan skipped: OCR is still running. Try again after it finishes.";
-        logEvent("auto_scan", message);
-        setToolStatus({ text: message, error: false });
-        return;
-      }
-      logEvent("auto_scan", `Simulated 3 blinks; camera ${cameraIndex} OCR requested`);
-    } catch (error) {
-      add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not start the blink test scan." });
-    } finally {
-      setBlinkTestCount(null);
-      scanControlWorking.current = false;
-    }
-  }
-
   async function controlScan(action: "capture" | "cancel") {
-    try {
-      if (action === "capture") await scans.capture();
-      else await scans.cancel();
-    } catch (error) {
-      add({ role: "error", text: error instanceof Error ? error.message : "Scan control failed. Try again." });
-    }
+    try { if (action === "capture") await scans.capture(); else await scans.cancel(); }
+    catch (error) { report(error); }
   }
-
-  async function startMicRecording() {
-    if (scanning || busy || micWorking.current) return;
+  async function send(event: FormEvent) {
+    event.preventDefault();
+    if (!input.trim()) return;
+    const question = input.trim();
     setToolStatus(null);
-    stopAudio();
-    if (!navigator.mediaDevices || typeof MediaRecorder === "undefined") { add({ role: "error", text: "This browser does not support microphone questions." }); return; }
-    micWorking.current = true;
-    setMicPending(true);
-    let microphone: MediaStream | null = null;
-    try {
-      microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const activeMicrophone = microphone;
-      const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(MediaRecorder.isTypeSupported);
-      const mediaRecorder = type ? new MediaRecorder(activeMicrophone, { mimeType: type }) : new MediaRecorder(activeMicrophone);
-      const chunks: BlobPart[] = [];
-      stream.current = activeMicrophone;
-      recorder.current = mediaRecorder;
-      mediaRecorder.ondataavailable = (event) => event.data.size && chunks.push(event.data);
-      mediaRecorder.onstop = async () => {
-        activeMicrophone.getTracks().forEach((track) => track.stop());
-        if (stream.current === activeMicrophone) stream.current = null;
-        if (recorder.current === mediaRecorder) recorder.current = null;
-        setRecording(false);
-        const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
-        if (!blob.size) { add({ role: "error", text: "I did not hear anything. Please try again." }); return; }
-        micWorking.current = true;
-        setMicPending(true);
-        try {
-          const result = await transcribe(blob);
-          micWorking.current = false;
-          await submit(result.text, true);
-        } catch (error) {
-          add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not transcribe that recording." });
-        } finally {
-          micWorking.current = false;
-          setMicPending(false);
-        }
-      };
-      mediaRecorder.start();
-      setRecording(true);
-    } catch {
-      microphone?.getTracks().forEach((track) => track.stop());
-      add({ role: "error", text: "Microphone permission is off. You can still type a question." });
-    } finally {
-      micWorking.current = false;
-      setMicPending(false);
-    }
+    try { await voice.sendText(question); setInput(""); }
+    catch (error) { report(error); }
   }
-
-  function stopWakeListening() {
-    wakeListeningRef.current = false;
-    setWakeListening(false);
-    const recognition = wakeRecognition.current;
-    wakeRecognition.current = null;
-    recognition?.abort();
-  }
-
-  async function greetAndRecord() {
-    if (wakeGreetingInProgress.current || scanning || busy || recording || micWorking.current) return;
-    wakeGreetingInProgress.current = true;
-    setToolStatus(null);
-    stopAudio();
-    const version = playbackVersion.current;
-    const controller = new AbortController();
-    speechRequest.current = controller;
-    setSpeaking(-1);
-    try {
-      const greetingFinished = await playClip(
-        makeSpeech(wakeGreeting, controller.signal), "neutral", controller, version, false,
-      );
-      if (!greetingFinished || controller.signal.aborted || playbackVersion.current !== version) return;
-      setSpeaking(null);
-      speechRequest.current = null;
-      await startMicRecording();
-    } catch (error) {
-      if (controller.signal.aborted || playbackVersion.current !== version) return;
-      add({ role: "notice", text: error instanceof LoobError ? error.message : "LOOB could not prepare its greeting." });
-    } finally {
-      if (playbackVersion.current === version) {
-        setSpeaking(null);
-        speechRequest.current = null;
-      }
-      wakeGreetingInProgress.current = false;
-    }
-  }
-
-  function toggleWakeListening() {
-    if (wakeListening) {
-      stopWakeListening();
-      return;
-    }
-    if (scanning || busy || recording || micWorking.current) return;
-    const Recognition = wakeRecognitionConstructor();
-    if (!Recognition) {
-      add({ role: "error", text: "Wake listening is available in Chrome or Edge. You can still use the microphone button." });
-      return;
-    }
-    const recognition = new Recognition();
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
-    recognition.onresult = (event) => {
-      for (let index = event.results.length - 1; index >= 0; index--) {
-        const transcript = event.results[index][0]?.transcript ?? "";
-        if (!/\bloob\b/i.test(transcript)) continue;
-        wakeListeningRef.current = false;
-        setWakeListening(false);
-        if (wakeRecognition.current === recognition) wakeRecognition.current = null;
-        recognition.stop();
-        logEvent("voice", 'Wake word "LOOB" heard');
-        void greetAndRecord();
-        return;
-      }
-    };
-    recognition.onerror = (event) => {
-      if (event.error !== "not-allowed" && event.error !== "service-not-allowed") return;
-      stopWakeListening();
-      add({ role: "error", text: "Microphone permission is needed to listen for LOOB." });
-    };
-    recognition.onend = () => {
-      if (wakeRecognition.current !== recognition || !wakeListeningRef.current) return;
-      window.setTimeout(() => {
-        if (wakeRecognition.current !== recognition || !wakeListeningRef.current) return;
-        try {
-          recognition.start();
-        } catch {
-          stopWakeListening();
-          add({ role: "error", text: "LOOB could not keep wake listening active. Arm it again to retry." });
-        }
-      }, 200);
-    };
-    wakeRecognition.current = recognition;
-    wakeListeningRef.current = true;
-    setWakeListening(true);
-    setToolStatus({ text: 'Listening for “LOOB”. Say “LOOB” to ask a question.', error: false });
-    try {
-      recognition.start();
-    } catch {
-      stopWakeListening();
-      add({ role: "error", text: "LOOB could not start wake listening. Check microphone permission and try again." });
-    }
-  }
-
-  async function toggleMic() {
-    if (recording) { recorder.current?.stop(); return; }
-    stopWakeListening();
-    await startMicRecording();
-  }
-
-  useEffect(() => () => {
-    wakeListeningRef.current = false;
-    wakeRecognition.current?.abort();
-    wakeRecognition.current = null;
-    stopAudio();
-    stream.current?.getTracks().forEach((track) => track.stop());
-  }, []);
-  useEffect(() => { if (tab === "reader") journalEnd.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, [messages, tab]);
-  function send(event: FormEvent) { event.preventDefault(); void submit(input); }
-  const paragraphs = storyParagraphs(pageText);
-  const controlsBusy = busy || micPending;
-  const wordsAsked = countAskedWords(askedTerms);
-  const journalMessages = messages.filter((message) => message.role === "user" || message.role === "assistant");
-  const latestAnswer = messages.findLast((message) => message.role === "assistant");
-  const wordCount = pageText.trim().split(/\s+/).length;
+  const scanning = scans.active || scans.action !== null;
+  const connecting = voice.status === "connecting" || voice.status === "closing";
+  const connected = voice.status === "connected";
+  const journal = groupTranscriptFragments(voice.fragments);
   const liveEyes = diagnostics.status === "connected" && diagnostics.data?.connected ? diagnostics.data : null;
   const eyeOpenness = liveEyes?.eyes_visible && liveEyes.openness
     ? Math.round((Math.min(1, liveEyes.openness.left) + Math.min(1, liveEyes.openness.right)) * 50) : null;
+  const statusText = voice.pendingScanId ? "Reading the captured page…"
+    : pendingCapture ? "Page captured. Start conversation to process it."
+      : connecting ? "Connecting voice…" : connected ? voice.microphoneMuted ? "Microphone muted" : "Conversation open · listening" : "Conversation ended";
+  const connectionButton = <button className="notebook-button conversation-button" type="button" disabled={connecting} onClick={() => connected ? voice.end() : void startConversation().catch(report)}>{connected ? "End conversation" : "Start conversation"}</button>;
+  const readControls = <div className="conversation-actions">
+    <button className="notebook-button reader-read" type="button" onClick={() => void voice.readPage().catch(report)} disabled={connecting} aria-label="Read story">Read</button>
+    <button className="notebook-button" type="button" onClick={voice.stop} disabled={!connected && !connecting} aria-label="Stop audio">Stop</button>
+  </div>;
+  const scanProcessingControls = capturedPage && <div className="conversation-actions">
+    <button className="notebook-button" type="button" disabled={connecting} onClick={() => void retryProcessing().catch(report)}>Retry processing</button>
+    <button className="notebook-button" type="button" disabled={!connected} onClick={voice.stop}>Cancel processing</button>
+  </div>;
 
-  function passageText(text: string) {
-    const terms = [...new Set(askedTerms.map((term) => term.replace(/\s+/g, " ")))].sort((a, b) => b.length - a.length);
-    if (!terms.length) return text;
-    const pattern = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-    return text.split(new RegExp(`(?<![\\p{L}\\p{N}])(${pattern})(?![\\p{L}\\p{N}])`, "giu")).map((part, index) => index % 2 ? <mark key={index}>{part}</mark> : part);
-  }
-
-  return (
-    <main className="reading-workspace">
-      <header className="desk-meta"><div className="app-logo-lockup" aria-label="LOOB"><Image className="app-logo-symbol" src={loobSymbol} alt="" priority /><span className="app-logo-name">LOOB</span></div></header>
-      <div className="notebook">
-        <div className="notebook-art" aria-hidden="true"><Image src={notebook} alt="" fill sizes="(max-width: 760px) 1600px, 1400px" placeholder="blur" preload /></div>
-        <button
-          id="view-bookmark"
-          className="paper-bookmark"
-          type="button"
-          aria-label={tab === "reader" ? "Open Developer view" : "Return to Reader view"}
-          aria-controls={tab === "reader" ? "developer-panel" : "reader-panel"}
-          title={tab === "reader" ? "Open Developer view" : "Return to Reader view"}
-          onClick={() => setTab((current) => current === "reader" ? "developer" : "reader")}
-        >
-          <Image src={bookmark} alt="" sizes="208px" draggable={false} />
-          <span className="bookmark-label" aria-hidden="true">{tab === "reader" ? "Developer" : "Reader"} ↗</span>
-        </button>
-
-        <div id="reader-panel" className="notebook-spread" role="region" aria-label="Reader" hidden={tab !== "reader"}>
-          <section className="notebook-page left-page journal-page" aria-label="Reading journal">
-            <header className="page-heading"><span className="folio-heading">01</span><div><h1>{pageTitle}</h1><p className="page-subtitle">{sessionDate} · reading log</p></div></header>
-            <div className="reader-mode"><span>Mode: <strong>{tracker.applied && tracker.data?.applied_blink_only ? scanning ? "Blink test · scan in progress" : "Blink test · ready" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused · gaze to restart" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
-            <div className="journal-toolbar">
-              <h2 className="journal-heading">Voice log</h2>
-              <button className={`notebook-button wake-button${wakeListening ? " listening" : ""}`} type="button" disabled={!wakeListening && (controlsBusy || scanning || recording)} onClick={toggleWakeListening} aria-pressed={wakeListening}>{wakeListening ? "Listening for LOOB" : "Call LOOB"}</button>
-              <button className={`icon-button reader-mic${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"} aria-pressed={recording} title={recording ? "Stop recording" : "Ask with your voice"}><DeskIcon name={recording ? "stop" : "mic"} width="19" height="19" /></button>
-              {(recording || wakeListening) && <span className="listening-note" role="status">{recording ? "listening…" : 'say “LOOB”'}</span>}
-            </div>
-            <form className="reader-composer" onSubmit={send}>
-              <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask about this page…" aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />
-              <button className="icon-button" type="submit" aria-label="Send question" disabled={controlsBusy || recording || scanning || !input.trim()}><DeskIcon name="send" width="22" height="22" /></button>
-            </form>
-            {controlsBusy && <p className="reader-status" role="status">{micPending ? "Preparing your voice question…" : "Answering…"}</p>}
-            {toolStatus && <p className={`reader-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
-            <div className="journal-lines">
-              <div className="journal-messages" role="log" aria-label="Questions and answers" aria-live="polite" tabIndex={0}>
-                {journalMessages.map((message) => <div key={message.id} className={`journal-entry ${message.role}`}>
-                  <span>{message.role === "user" ? `“${message.text}”` : `(${message.text})`}</span>
-                </div>)}
-                <div ref={journalEnd} />
-              </div>
-            </div>
-            <footer className="page-footer"><span>01 <span className="footer-title">{pageTitle}</span></span><span>Voice log</span></footer>
-          </section>
-
-          <section className="notebook-page right-page story-page" aria-label="Story">
-            <header className="story-heading">
-              <span className="page-kicker">{pageScanned ? "Scanned page" : "01 · Story"}</span>
-              <div className="story-heading-actions"><span className="word-count">{wordCount} words</span><button className="notebook-button reader-read" type="button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy} aria-label={speaking !== null ? "Stop audio" : "Read story"}>{speaking !== null ? "Stop" : "Read"}</button></div>
-            </header>
-            <article className="story-text" aria-label="Story text" tabIndex={0}>
-              {paragraphs.map((paragraph, index) => <p key={`${index}-${paragraph}`} className={`story-paragraph${activeParagraph === index ? " active" : ""}`}>{passageText(paragraph)}</p>)}
-              {wordNote && <aside className="word-note" aria-label={`Meaning of ${wordNote.term}`}>
-                <Image src={stickyNote} alt="" fill sizes="250px" aria-hidden="true" />
-                <div className="word-note-content" tabIndex={0}><h2>{wordNote.term}</h2><p>{wordNote.answer}</p></div>
-              </aside>}
-            </article>
-            <footer className="page-footer"><span>{wordsAsked} {wordsAsked === 1 ? "word" : "words"} asked</span><span>02</span></footer>
-          </section>
-        </div>
-
-        <div id="developer-panel" className="notebook-spread" role="region" aria-label="Developer" hidden={tab !== "developer"}>
-          <DeveloperPanel visible={tab === "developer"} diagnostics={diagnostics} tracker={tracker} lastScan={lastScan} scanJob={scans.job} scanConnected={scans.connected} scanError={scans.error} scanAction={scans.action} scanDisabled={controlsBusy || recording || scanning || !scans.connected || blinkTestCount !== null} blinkTestCount={blinkTestCount} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} onCapture={() => void controlScan("capture")} onCancel={() => void controlScan("cancel")} onTestThreeBlinks={() => void testThreeBlinks()} events={events}>
-            <section className="reader-tools" aria-labelledby="reader-tools-heading">
-              <h3 id="reader-tools-heading">Reader controls</h3>
-              <div className="narration-actions">
-                <button className="notebook-button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy}>{speaking !== null ? "Stop audio" : "Read page"}</button>
-                {latestAnswer && <button className="text-button" onClick={() => void play(latestAnswer.text, latestAnswer.id)} disabled={scanning || recording || controlsBusy}>Replay answer</button>}
-              </div>
-              <div className="sound-settings">
-                <label className="immersive-toggle"><input type="checkbox" checked={immersive} onChange={(event) => { stopAudio(); setImmersive(event.target.checked); }} /><span className="toggle-track" aria-hidden="true" /> Immersive narration</label>
-                <label className="sound-volume"><DeskIcon name="volume" width="14" height="14" /><span className="sr-only">Immersive sounds volume</span><input type="range" min="0" max="100" value={ambientVolume} disabled={!immersive} onChange={(event) => { const value = Number(event.target.value); setAmbientVolume(value); ambience.current?.setVolume(value / 100); }} /><output>{ambientVolume}%</output></label>
-              </div>
-              {immersive && pageMoods && <p className="narration-moods">{pageMoods.join(" · ")}</p>}
-              <form className="developer-composer" onSubmit={send}>
-                <button className={`icon-button${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"}><DeskIcon name={recording ? "stop" : "mic"} width="18" height="18" /></button>
-                <input ref={questionInput} value={input} onChange={(event) => setInput(event.target.value)} placeholder={recording ? "Recording…" : "Ask about this page"} aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />
-                <button className="icon-button" aria-label="Send question" disabled={controlsBusy || recording || scanning || !input.trim()}><DeskIcon name="send" width="19" height="19" /></button>
-              </form>
-              {controlsBusy && <p className="tool-status" role="status">{micPending ? "Transcribing…" : "Answering…"}</p>}
-              {toolStatus && <p className={`tool-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
-            </section>
-          </DeveloperPanel>
-        </div>
+  return <main className="reading-workspace">
+    <header className="desk-meta"><div className="app-logo-lockup" aria-label="LOOB"><Image className="app-logo-symbol" src={loobSymbol} alt="" preload /><span className="app-logo-name">LOOB</span></div></header>
+    <div className="notebook">
+      <div className="notebook-art" aria-hidden="true"><Image src={notebook} alt="" fill sizes="(max-width: 760px) 1600px, 1400px" placeholder="blur" preload /></div>
+      <button id="view-bookmark" className="paper-bookmark" type="button" aria-label={tab === "reader" ? "Open Developer view" : "Return to Reader view"} aria-controls={tab === "reader" ? "developer-panel" : "reader-panel"} title={tab === "reader" ? "Open Developer view" : "Return to Reader view"} onClick={() => setTab((current) => current === "reader" ? "developer" : "reader")}>
+        <Image src={bookmark} alt="" sizes="208px" draggable={false} /><span className="bookmark-label" aria-hidden="true">{tab === "reader" ? "Developer" : "Reader"} ↗</span>
+      </button>
+      <div id="reader-panel" className="notebook-spread" role="region" aria-label="Reader" hidden={tab !== "reader"}>
+        <section className="notebook-page left-page journal-page" aria-label="Reading journal">
+          <header className="page-heading"><span className="folio-heading">01</span><div><h1>{page.title}</h1><p className="page-subtitle">{sessionDate} · reading log</p></div></header>
+          <div className="reader-mode"><span>Mode: <strong>{tracker.applied && tracker.data?.applied_blink_only ? scanning ? "Blink test · scan in progress" : "Blink test · ready" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused · gaze to restart" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
+          <div className="journal-toolbar"><h2 className="journal-heading">Voice log</h2>{connectionButton}
+            <button className="icon-button reader-mic" type="button" disabled={!connected} onClick={voice.toggleMute} aria-label={voice.microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={voice.microphoneMuted} title={voice.microphoneMuted ? "Unmute microphone" : "Mute microphone"}><DeskIcon name="mic" width="19" height="19" /></button>
+          </div>
+          <form className="reader-composer" onSubmit={(event) => void send(event)}><input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask about this page…" aria-label="Question about the page" disabled={connecting} maxLength={2000} /><button className="icon-button" type="submit" aria-label="Send question" disabled={connecting || !input.trim()}><DeskIcon name="send" width="22" height="22" /></button></form>
+          <p className="reader-status" role="status">{statusText}</p>
+          {scanProcessingControls}
+          {voice.error && <p className="reader-status is-error" role="alert">{voice.error}</p>}
+          {toolStatus && <p className={`reader-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
+          <div className="journal-lines"><div className="journal-messages" role="log" aria-label="Questions and answers" aria-live="polite" tabIndex={0}>{journal.map((entry) => <div key={entry.id} className={`journal-entry ${entry.speaker}`}><span>{entry.text}</span></div>)}<div ref={journalEnd} /></div></div>
+          <footer className="page-footer"><span>01 <span className="footer-title">{page.title}</span></span><span>Voice log</span></footer>
+        </section>
+        <section className="notebook-page right-page story-page" aria-label="Story">
+          <header className="story-heading"><span className="page-kicker">{page.id === "sample" ? "01 · Story" : "Scanned page"}</span><div className="story-heading-actions">{readControls}</div></header>
+          <article className="story-text" aria-label="Story text" tabIndex={0}>{page.text.split(/\n\s*\n/).filter(Boolean).map((paragraph, index) => <p key={index} className="story-paragraph">{paragraph}</p>)}</article>
+          <footer className="page-footer"><span>{page.id === "sample" ? "Sample story" : "Current book page"}</span><span>02</span></footer>
+        </section>
       </div>
-    </main>
-  );
+      <div id="developer-panel" className="notebook-spread" role="region" aria-label="Developer" hidden={tab !== "developer"}>
+        <DeveloperPanel visible={tab === "developer"} diagnostics={diagnostics} tracker={tracker} lastScan={lastScan} scanJob={scans.job} scanConnected={scans.connected} scanError={scans.error} scanAction={scans.action} scanDisabled={scanning || !scans.connected || blinkTestCount !== null} blinkTestCount={blinkTestCount} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} onCapture={() => void controlScan("capture")} onCancel={() => void controlScan("cancel")} onTestThreeBlinks={() => void scanPage("test")} events={events}>
+          <section className="reader-tools" aria-labelledby="reader-tools-heading"><h3 id="reader-tools-heading">Reader controls</h3>{connectionButton}{readControls}<p className="tool-status" role="status">{statusText}</p>{scanProcessingControls}{voice.error && <p className="tool-status is-error" role="alert">{voice.error}</p>}{toolStatus && <p className={`tool-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}</section>
+        </DeveloperPanel>
+      </div>
+    </div>
+  </main>;
 }

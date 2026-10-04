@@ -22,7 +22,6 @@ REQUIRED_FLIP_BLINKS = 3
 # three-blink requirement is the guard against an isolated bad frame.
 OPEN_STABLE_FRAMES = 1
 SAFETY_CLOSE_SECONDS = 10.0
-SIGNAL_SECONDS = 0.75
 
 
 @dataclass(frozen=True)
@@ -55,18 +54,13 @@ class ReadModeController:
         self._last_blink_at: float | None = None
         self._pending_blink_duration: float | None = None
         self._open_frames = 0
-        self._signal_until: float | None = None
         self._awaiting_open = False
 
     def set_blink_only(self, enabled: bool, *, force: bool = False) -> None:
         """Applying either setting starts a fresh gesture in the stopped mode."""
         if self.blink_only != enabled or force:
-            signal_until = self._signal_until if self.mode == "SIGNAL" else None
             self.blink_only = enabled
             self.reset()
-            if signal_until is not None:
-                self.mode = "SIGNAL"
-                self._signal_until = signal_until
 
     def _clear_blinks(self) -> None:
         self._blink_count = 0
@@ -95,10 +89,11 @@ class ReadModeController:
         self._last_blink_at = now
         return True
 
-    def _emit_flip(self, now: float) -> None:
+    def _emit_flip(self) -> None:
         self._send_command("flip right")
-        self.mode = "SIGNAL"
-        self._signal_until = now + SIGNAL_SECONDS
+        self.mode = "STOP"
+        self._toggle_armed = False
+        self._camera_gaze_started_at = None
         self._clear_blinks()
 
     def update(
@@ -114,23 +109,13 @@ class ReadModeController:
         """Advance the controller and return a display-ready immutable snapshot."""
         blink_recorded = False
         last_blink_duration: float | None = None
-        if self.mode == "SIGNAL" and self._signal_until is not None and now >= self._signal_until:
-            # A completed turn leaves reading mode. The reader must look away
-            # and deliberately hold their gaze again before another turn is
-            # possible, which gives the physical page time to settle.
-            self.mode = "STOP"
-            self._signal_until = None
-            self._toggle_armed = False
-            self._camera_gaze_started_at = None
-            self._clear_blinks()
-
-        interrupted = turns_blocked or not calibrated or not eyes_visible or self.mode == "SIGNAL"
+        interrupted = turns_blocked or not calibrated or not eyes_visible
         if interrupted:
             self._awaiting_open = True
         if interrupted or (self._awaiting_open and not eyes_open):
             # Landmark loss is common on low-resolution cameras. Do not treat it
             # as a blink. No partial gesture survives a busy scanner, calibration,
-            # lost face or page signal, including a closure across these states.
+            # or lost face, including a closure across these states.
             self._eyes_closed_started_at = None
             self._camera_gaze_started_at = None
             self._clear_blinks()
@@ -207,14 +192,17 @@ class ReadModeController:
             self._clear_blinks()
 
         reported_blink_count = self._blink_count
-        if (self.mode == "READ" or self.blink_only) and self._blink_count >= REQUIRED_FLIP_BLINKS:
-            self._emit_flip(now)
+        flipped = (
+            (self.mode == "READ" or self.blink_only) and self._blink_count >= REQUIRED_FLIP_BLINKS
+        )
+        if flipped:
+            self._emit_flip()
 
         look_progress = 0.0
         if self._camera_gaze_started_at is not None:
             look_progress = min(now - self._camera_gaze_started_at, TOGGLE_HOLD_SECONDS)
         return ReadModeSnapshot(
-            display_mode=self.mode,
+            display_mode="SIGNAL" if flipped else self.mode,
             look_progress=look_progress,
             # Preserve the successful final count for this frame even though
             # the next reading session starts with a clean gesture.

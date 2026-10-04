@@ -55,7 +55,7 @@ def test_three_blinks_stops_read_mode_until_a_new_gaze_hold() -> None:
     assert update(controller, 9.0).display_mode == "READ"
 
 
-def test_blink_only_runs_in_stop_and_rearms_after_signal_without_gaze():
+def test_blink_only_accepts_next_three_blinks_without_a_settling_guard():
     commands = []
     controller = read_mode_state.ReadModeController(commands.append)
     controller.set_blink_only(True)
@@ -63,14 +63,11 @@ def test_blink_only_runs_in_stop_and_rearms_after_signal_without_gaze():
     blink(controller, 0.3)
     blink(controller, 0.6)
     assert commands == ["flip right"]
-    # Extra blinks during the page signal never accumulate.
     blink(controller, 0.9)
     blink(controller, 1.2)
-    assert update(controller, 1.5).blink_count == 0
+    assert update(controller, 1.3).blink_count == 2
     assert controller.mode == "STOP"
-    blink(controller, 1.6)
-    blink(controller, 1.9)
-    blink(controller, 2.2)
+    blink(controller, 1.4)
     assert commands == ["flip right", "flip right"]
 
 
@@ -128,16 +125,16 @@ def test_long_closure_and_window_expiry_cannot_complete_old_sequence():
     assert commands == ["flip right"]
 
 
-def test_changing_setting_cannot_shorten_active_signal():
+def test_flip_signal_is_one_display_frame_and_setting_change_resets_gesture():
     commands = []
     controller = read_mode_state.ReadModeController(commands.append)
     controller.set_blink_only(True)
     for now in (0, 0.3, 0.6):
         blink(controller, now)
     controller.set_blink_only(False)
-    assert update(controller, 0.8).display_mode == "SIGNAL"
+    assert update(controller, 0.8).display_mode == "STOP"
     controller.set_blink_only(True)
-    assert update(controller, 1.0).display_mode == "SIGNAL"
+    assert update(controller, 1.0).display_mode == "STOP"
     assert update(controller, 1.5).display_mode == "STOP"
 
 

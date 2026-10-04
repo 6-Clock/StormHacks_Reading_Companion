@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { scanIsActive, type CameraScan, type ScanJob, type ScanStatus } from "@/lib/api";
 import type { TrackerSettingsControl } from "@/lib/tracker-settings";
 import type { DiagnosticEvent, EyeDiagnosticsState } from "@/lib/diagnostics";
@@ -48,26 +48,12 @@ function directionLabel(gaze: { x: number; y: number } | null) {
 }
 
 const scanLabels: Record<ScanStatus, string> = {
-  idle: "Ready to scan", reserved: "Page turn reserved", queued: "Starting scan",
-  settling: "Waiting for page to settle", opening_camera: "Opening camera",
+  idle: "Ready to scan", queued: "Starting scan", opening_camera: "Opening camera",
   waiting_for_eye_camera: "Waiting for eye camera to close",
-  framing: "Frame the page", capturing: "Capturing page", transcribing: "Reading text",
-  reviewing: "Checking text", preview: "Preparing preview", cancelling: "Cancelling scan…",
-  accepted: "Page accepted", rejected: "Page not clear enough", unchanged: "Same page",
-  cancelled: "Scan cancelled", failed: "Scan failed", timed_out: "Scan timed out",
+  framing: "Frame the page", capturing: "Capturing page", captured: "Page captured", cancelling: "Cancelling scan…",
+  accepted: "Page accepted", rejected: "Page not clear enough",
+  cancelled: "Scan cancelled", failed: "Scan failed",
 };
-
-function PageTurnCountdown({ startsAt, duration }: { startsAt: number; duration: number }) {
-  const [now, setNow] = useState<number | null>(null);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 100);
-    return () => clearInterval(timer);
-  }, []);
-  const remaining = Math.max(0, Math.ceil(now === null ? duration : startsAt - now / 1_000));
-  return <p className="auto-scan-status" role="timer" aria-label="Page-turn wait">
-    {remaining > 0 ? `OCR starts in ${remaining}s · waiting for the page to turn.` : "Page-turn wait complete · preparing OCR…"}
-  </p>;
-}
 
 export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJob, scanConnected, scanError, scanAction, scanDisabled = false, blinkTestCount, cameraIndex, onCameraIndexChange, onScan, onCapture, onCancel, onTestThreeBlinks, events, children }: DeveloperPanelProps) {
   const data = diagnostics.data;
@@ -84,8 +70,6 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
     .filter((event, index, all) => all.findIndex((item) => item.id === event.id) === index)
     .sort((a, b) => b.time - a.time)
     .slice(0, 20);
-  const confidence = lastScan?.result.metrics.vision_confidence;
-  const scanWordCount = lastScan?.result.text.trim() ? lastScan.result.text.trim().split(/\s+/).length : 0;
   const scanning = scanIsActive(scanJob);
   const blinkOnly = tracker.applied && tracker.data?.applied_blink_only === true;
   const trackerStatus = !tracker.connected ? "Settings service offline"
@@ -176,11 +160,9 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
             <button type="button" className="notebook-button" onClick={onScan} disabled={scanning || scanDisabled}>{scanning ? "Scanning…" : "Scan OCR"}</button>
           </div>
         </div>
-        {scanJob?.status === "settling" && typeof scanJob.scan_starts_at === "number"
-          ? <PageTurnCountdown key={scanJob.job_id} startsAt={scanJob.scan_starts_at} duration={scanJob.settle_seconds ?? 8} />
-          : scanJob?.job_id && <p className="auto-scan-status" role="status">{scanJob.message}</p>}
+        {scanJob?.job_id && <p className="auto-scan-status" role="status">{scanJob.message}</p>}
         {scanning && <p className="auto-scan-status">New scan requests are skipped until this scan finishes.</p>}
-        {!scanning && <p className="auto-scan-status">Live camera and Scan OCR work with the eye tracker closed. If it is running, LOOB pauses it and resumes it after scanning.</p>}
+        {!scanning && <p className="auto-scan-status">Capture releases the camera before GPT-Live reads the image. Start a conversation to process captured pages.</p>}
         {scanError && <p className="control-error" role="alert">{scanError}</p>}
         {scanning && <div className="scan-recovery-controls">
           {scanJob?.status === "framing" && <button type="button" className="notebook-button" onClick={onCapture} disabled={recoveryDisabled}>{scanAction === "capture" ? "Capturing…" : "Capture now"}</button>}
@@ -188,20 +170,16 @@ export function DeveloperPanel({ visible, diagnostics, tracker, lastScan, scanJo
         </div>}
         {visible && scanJob?.job_id && scanJob.source === "manual" && ["opening_camera", "framing"].includes(scanJob.status)
           && <LiveCameraPreview key={scanJob.job_id} jobId={scanJob.job_id} cameraIndex={scanJob.camera_index ?? cameraIndex} />}
-        {scanJob?.status === "framing" && <p className="auto-scan-status">Position the page inside the guide, then choose Capture now to run OCR. Cancel scan closes the live camera. Preview reserves the camera and expires after 60 seconds.</p>}
-        <ScanPreview preview={lastScan?.result.capture_preview ?? null} />
-        {lastScan && <details className="ocr-details"><summary>OCR details</summary>
+        {scanJob?.status === "framing" && <p className="auto-scan-status">Position the page inside the guide, then choose Capture now. Cancel scan closes the live camera.</p>}
+        <ScanPreview preview={lastScan?.result ?? null} />
+        {lastScan && <details className="ocr-details"><summary>Capture details</summary>
           <dl className="diagnostic-metrics">
-            <div><dt>Words</dt><dd>{scanWordCount}</dd></div>
-            <div><dt>Confidence</dt><dd>{typeof confidence === "number" ? numberLabel(confidence * 100, "%") : "—"}</dd></div>
-            <div><dt>Sharpness</dt><dd>{typeof lastScan.result.metrics.sharpness === "number" ? numberLabel(lastScan.result.metrics.sharpness) : "—"}</dd></div>
-            <div><dt>Brightness</dt><dd>{typeof lastScan.result.metrics.brightness === "number" ? numberLabel(lastScan.result.metrics.brightness) : "—"}</dd></div>
-            <div><dt>Model</dt><dd>{lastScan.result.openai_review?.model ?? "—"}</dd></div>
-            <div><dt>Revision</dt><dd>{lastScan.result.openai_revision_status.replaceAll("_", " ")}</dd></div>
+            <div><dt>Width</dt><dd>{numberLabel(lastScan.result.width, "px")}</dd></div>
+            <div><dt>Height</dt><dd>{numberLabel(lastScan.result.height, "px")}</dd></div>
             <div><dt>Scan time</dt><dd>{(lastScan.durationMs / 1_000).toFixed(1)}s</dd></div>
             <div><dt>Captured</dt><dd>{clockLabel(lastScan.capturedAt / 1_000)}</dd></div>
           </dl>
-          <p className="scan-reason">{lastScan.result.reason.replaceAll("_", " ")}</p>
+          {lastScan.result.reason && <p className="scan-reason">{lastScan.result.reason}</p>}
         </details>}
         {children && <div className="developer-reader-controls">{children}</div>}
         <section className="command-log" aria-labelledby="command-log-heading">

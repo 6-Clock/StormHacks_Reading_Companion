@@ -5,18 +5,28 @@ build-backend = "hatchling.build"
 [project]
 name = "stormhacks2026-backend"
 version = "0.1.0"
-description = "FastAPI backend for StormHacks 2026"
+description = "GPT-Live session bootstrap and local book capture"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "fastapi>=0.115,<1.0",
-    "pydantic-settings>=2.6,<3.0",
+    "httpx>=0.27,<1.0",
+    "numpy>=1.26,<2.0",
+    "opencv-contrib-python>=4.10,<4.12",
+    "pydantic>=2.6,<3.0",
+    "python-dotenv>=1.0,<2.0",
     "uvicorn[standard]>=0.32,<1.0",
 ]
 
 [project.optional-dependencies]
+hardware = [
+    # The tracker uses the legacy Face Mesh API and its NumPy 1.x binaries.
+    "mediapipe==0.10.14",
+    "pyserial>=3.5,<4.0",
+]
+
+[dependency-groups]
 dev = [
-    "httpx>=0.27,<1.0",
     "pytest>=8.3,<9.0",
     "ruff>=0.8,<1.0",
 ]
