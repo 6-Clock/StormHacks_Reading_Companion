@@ -1,24 +1,10 @@
 GM6020 BOOK CLAMP: CURRENT FEEDBACK AND CONTACT STOP
 
 Implemented in Core/Inc/gm6020.h and Core/Src/gm6020.c.
-MainTask starts once on boot on CAN1 motor 2 at -60 RPM. Each debounced
-PA0 press rearms another run with the opposite direction: +60, -60, +60...
-Your settings are retained: PID {55, 0.01, 0}, raw-current threshold 2500,
-5 ms confirmation, 3 second timeout, voltage command limit 10000.
-PA0 is configured as an input with pull-up. Connect the button to GND:
-LOW is pressed. Press and release each require 30 ms of stable input.
-Holding the button, including through startup, does not cause repeated starts.
-A press during motion restarts the closure with opposite target RPM.
-A failed start does not advance the direction or reset the existing status.
-If load remains at or above the threshold, start is rejected: release and
-press again after the load/current settles. No automatic retry is performed.
-Contact/faults stay stopped until a new deliberate button press.
-Debugger watches: clampExampleCurrentRaw, clampExamplePeakRaw,
-clampExampleState, clampExampleTargetRPM, clampExampleStarted,
-clampExampleStartRejected, clampExampleFinished. Current remains at the last
-fresh value if feedback is lost. No N*m calibration is required.
-The button input and initial wait are polled by MainTask at 5 ms intervals.
-Button presses during the initial up-to-2-second feedback wait are not processed.
+MainTask now uses a three-state sequence instead of direction toggling.
+See BOOK_STATE_MACHINE_README.txt for the button sequence and servo values.
+The motor is stopped at boot in state 1. State 2 runs guarded +60 RPM, while
+state 3 and state 1 command zero drive. RunBookClamp remains outside MainTask.
 The existing 1 ms LibraryHandler automatically handles the stop.
 
 READ LOAD

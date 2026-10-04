@@ -30,6 +30,15 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+  BOOK_STATE_1 = 1,
+  BOOK_STATE_2 = 2,
+  BOOK_STATE_3 = 3,
+  BOOK_STATE_4 = 4,
+  BOOK_STATE_5 = 5,
+  BOOK_STATE_6 = 6,
+  BOOK_STATE_7 = 7
+} BookDeviceState;
 
 /* USER CODE END PTD */
 
@@ -73,6 +82,8 @@ const osThreadAttr_t UartTast_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
+volatile BookDeviceState bookDeviceState = BOOK_STATE_1;
+volatile bool bookStateActionAccepted = true;
 /* Watch these in the debugger while tuning the clamp. Raw counts, not N*m. */
 volatile int16_t clampExampleCurrentRaw = 0;
 volatile uint16_t clampExamplePeakRaw = 0;
@@ -97,9 +108,9 @@ void StartMainTask(void *argument);
 void StartUartTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-static bool WaitForBookClampFeedback(uint32_t timeoutMs);
 static bool RunBookClamp(float closingRPM);
 static void UpdateBookClampStatus(void);
+static void EnterBookState(BookDeviceState state);
 
 /* USER CODE END PFP */
 
@@ -442,25 +453,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /* Book clamp helpers: no button handling or direction toggling here. */
-static bool WaitForBookClampFeedback(uint32_t timeoutMs)
-{
-  GM6020_Feedback feedback;
-  const uint32_t started = HAL_GetTick();
-  while ((uint32_t)(HAL_GetTick() - started) < timeoutMs)
-  {
-    if (get6020Feedback(1, 2, &feedback) && feedback.online)
-    {
-      clampExampleCurrentRaw = feedback.current_raw;
-      return true;
-    }
-    osDelay(5);
-  }
-  (void)stop6020(1, 2);
-  clampExampleState = GM6020_CLAMP_FEEDBACK_LOST;
-  clampExampleFinished = true;
-  return false;
-}
-
 static bool RunBookClamp(float closingRPM)
 {
   const float pid[3] = {55.0f, 0.01f, 0.0f};
@@ -508,6 +500,55 @@ static void UpdateBookClampStatus(void)
 }
 
 
+/* Apply outputs once on entry. Button handling remains in MainTask.
+ * State 2 starts a guarded +60 RPM run; contact/faults do not advance state. */
+static void EnterBookState(BookDeviceState state)
+{
+  uint16_t pulse1, pulse2, pulse3, pulse4;
+  switch (state)
+  {
+    case BOOK_STATE_2:
+      pulse1 = 2100, pulse2 = 1600; pulse3 = 1400; pulse4 = 800;
+      break;
+    case BOOK_STATE_3:
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 800;
+      break;
+    case BOOK_STATE_4:
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800;
+      break;
+    case BOOK_STATE_5:
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 2100; pulse4 = 1800;
+      break;
+    case BOOK_STATE_6:
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800;
+      break;
+    case BOOK_STATE_1:
+    default:
+      state = BOOK_STATE_1;
+      pulse1 = 2100, pulse2 = 1200; pulse3 = 1800; pulse4 = 800;
+      break;
+  }
+
+  if (state != BOOK_STATE_2)
+  {
+    bookStateActionAccepted = stop6020(1, 2);
+    clampExampleStarted = false;
+    clampExampleStartRejected = false;
+    clampExampleFinished = true;
+    clampExampleTargetRPM = 0.0f;
+    clampExampleState = GM6020_CLAMP_STOPPED;
+  }
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse1);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse2);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse3);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse4);
+  bookDeviceState = state;
+
+  if (state == BOOK_STATE_2)
+    bookStateActionAccepted = RunBookClamp(60.0f);
+}
+
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
 {
   CAN_RxHeaderTypeDef header;
@@ -553,25 +594,19 @@ void StartMainTask(void *argument)
 {
   /* USER CODE BEGIN StartMainTask */
   (void)argument;
-  float nextRPM = -60.0f;
 
-  /* Start once on boot. Direction changes only after an accepted run. */
-  if (WaitForBookClampFeedback(2000U) && RunBookClamp(nextRPM))
-    nextRPM = -nextRPM;
+  /* Load state 1 pulses before enabling the outputs; no clamp motion at boot. */
+  EnterBookState(BOOK_STATE_1);
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK ||
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) != HAL_OK)
+    Error_Handler();
 
   /* PA0 pull-up: LOW is pressed. Ignore a button held during startup. */
   bool buttonSample = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
   bool buttonStable = buttonSample;
   uint32_t buttonChangedMs = HAL_GetTick();
-
-  uint16_t pulse1 = 1000;
-//  uint16_t pulse2 = 1000;
-  uint16_t pulse3 = 2000;
-//  uint16_t pulse4 = 1000;
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Front page gripping servo
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); // Left page holding servo
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); // Right page holding servo
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); // Back page indexing servo
 
   for (;;)
   {
@@ -586,28 +621,12 @@ void StartMainTask(void *argument)
     if (buttonSample != buttonStable && (uint32_t)(now - buttonChangedMs) >= 30U)
     {
       buttonStable = buttonSample;
-      /* One rearm per press; rejected starts leave the next direction intact. */
-
-      if (buttonStable && RunBookClamp(nextRPM)) {
-    	  nextRPM = -nextRPM;
-      }
-
-      if (buttonStable) {
-    	  if (pulse1 < 2000) {
-    		  pulse1 = pulse1 + 100;
-    	  } else {
-    		  pulse1 = 1000;
-    	  }
-
-    	  if (pulse3 > 1000) {
-    		  pulse3 = pulse3 - 100;
-    	  } else {
-    		  pulse1 = 2000;
-    	  }
-    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse1);
-    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse1);
-    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse3);
-    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse1);
+      if (buttonStable)
+      {
+        /* One transition per press: 1 -> 2 -> 3 -> 1. */
+        const BookDeviceState next = bookDeviceState == BOOK_STATE_6 ?
+            BOOK_STATE_2 : (BookDeviceState)(bookDeviceState + 1);
+        EnterBookState(next);
       }
     }
 
