@@ -40,6 +40,7 @@ CAMERA_GAZE_Y = (0.30, 0.70)
 FACE_CENTER_X = (0.38, 0.62)
 MIN_FACE_WIDTH_PIXELS = 55
 GAZE_SMOOTHING = 0.35
+UART_COMMANDS = {"flip right": "50"}
 
 LEFT_EYE = {"outer": 33, "inner": 133, "top": 159, "bottom": 145, "iris": 468}
 RIGHT_EYE = {"outer": 263, "inner": 362, "top": 386, "bottom": 374, "iris": 473}
@@ -200,27 +201,48 @@ class LatestFrameReader:
 
 
 class SerialCommandSender:
-    """Send newline-delimited commands to future book-flipper hardware."""
+    """Transmit LF-delimited commands through a USB-to-TTL UART adapter."""
 
     def __init__(self, port: str | None, baud: int) -> None:
         self.connection: serial.Serial | None = None
         if port:
-            self.connection = serial.Serial(port=port, baudrate=baud, timeout=1, write_timeout=1)
-            print(f"Serial hardware connected: {port} at {baud} baud")
+            # The STM32 link is TX-only: USB-to-TTL TXD -> STM32 RX. Make the
+            # UART frame explicit instead of relying on pyserial defaults.
+            self.connection = serial.Serial(
+                port=port,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0,
+                write_timeout=1,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+            )
+            print(f"UART TX connected: {port} at {baud} baud (8N1, no flow control)")
         else:
-            print("Serial preview mode: use --port COM3 when hardware is connected.")
+            print("UART preview mode: use --port COM3 when the USB-to-TTL adapter is connected.")
 
     def send(self, command: str) -> None:
-        payload = f"{command}\n".encode("ascii")
+        try:
+            uart_command = UART_COMMANDS[command]
+        except KeyError as error:
+            raise ValueError(f"Unsupported UART command: {command!r}") from error
+
+        payload = f"{uart_command}\n".encode("ascii")
         if self.connection is not None:
             # write_timeout=1 bounds the send. flush() can wait indefinitely on
             # some drivers and would outlive the coordinator's reservation.
             written = self.connection.write(payload)
             if written != len(payload):
                 raise serial.SerialTimeoutException("Incomplete page-turn command write")
-            print(f"[SERIAL TX] {command}")
+            print(
+                f"[UART TX {self.connection.port} {self.connection.baudrate} 8N1] "
+                f"{command!r} -> {payload!r}"
+            )
         else:
-            print(f"[SERIAL PREVIEW] {command}")
+            print(f"[UART PREVIEW] {command!r} -> {payload!r}")
 
     def close(self) -> None:
         if self.connection is not None and self.connection.is_open:
@@ -310,8 +332,16 @@ def main() -> int:
         default=8.0,
         help="Seconds to wait after a flip before capturing the page (8–30; default: 8).",
     )
-    parser.add_argument("--port", help="Hardware serial port, for example COM3. Omit for preview mode.")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument(
+        "--port",
+        help="USB-to-TTL adapter COM port, for example COM3. Omit for UART preview mode.",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=115200,
+        help="USB-to-TTL / STM32 UART baud rate (default: 115200; 8N1, no flow control).",
+    )
     parser.add_argument("--width", type=int, default=DEFAULT_CAPTURE_WIDTH, help="Requested camera width (default: 640).")
     parser.add_argument("--height", type=int, default=DEFAULT_CAPTURE_HEIGHT, help="Requested camera height (default: 480).")
     parser.add_argument("--fps", type=int, default=DEFAULT_CAPTURE_FPS, help="Requested camera FPS (default: 30).")
@@ -472,7 +502,9 @@ def main() -> int:
             frame_id, captured_at, captured_epoch, frame = newest
             previous_frame_id = frame_id
             now = captured_at
-            frame = cv2.flip(frame, 1)
+            # Keep the mirrored eye-camera view and correct its upside-down
+            # mounting before both MediaPipe and blink detection use the frame.
+            frame = cv2.flip(frame, -1)
             analysis_frame = frame
             if args.inference_width > 0 and frame.shape[1] > args.inference_width:
                 scale = args.inference_width / frame.shape[1]

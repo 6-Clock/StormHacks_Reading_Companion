@@ -42,6 +42,16 @@ ends. Changing the setting clears partial gestures. Change the wait with
 `--ocr-settle-seconds` (8–30 seconds); omit `--ocr-camera` to disable automatic OCR. FastAPI is
 still required for coordinated turns without OCR. Camera indexes must differ.
 
+### STM32 USB-to-TTL UART output
+
+Pass the adapter's COM port to the tracker, for example:
+
+```powershell
+python ".\backend\computer vision\eyetracking_opencv.py" --camera 1 --ocr-camera 2 --port COM3 --baud 115200
+```
+
+The tracker opens a TX-only UART link at 115200 8N1 with no flow control. After an accepted three-blink page turn, it maps its internal `flip right` action to the LF-terminated ASCII frame `50\n` (`0x35 0x30 0x0A`). Wire USB-to-TTL **TXD** to the STM32's selected USART **RX**, and connect both grounds. Use a 3.3 V logic-level adapter; leave the adapter RX and STM32 TX disconnected for this one-way setup. The tracker terminal prints each actual payload as `[UART TX ...]`; a second serial console cannot open the same COM port concurrently.
+
 For eye tracking alone, keep FastAPI running and use
 `python ".\backend\computer vision\eyetracking_opencv.py" --camera 1`.
 Manual scans and simulated blink scans also work without a running eye tracker.

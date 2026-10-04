@@ -17,12 +17,28 @@ import loobSymbol from "@/assets/loob-logo-symbol.svg";
 
 type Message = { id: number; role: "user" | "assistant" | "notice" | "error"; text: string; voice?: boolean };
 type DeskEvent = { id: string; time: number; type: string; message: string };
+type WakeRecognitionEvent = {
+  results: { length: number; [index: number]: { 0?: { transcript?: string } } };
+};
+type WakeRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: WakeRecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+type WakeRecognitionConstructor = new () => WakeRecognition;
 
 const initialPassage = [
   "At midnight, Mara stepped into the empty house. Footsteps sounded above her, though no one was supposed to be there. A shadow slid across the stairwell, and a whisper called her name.",
   "She followed the sound to the attic. The door creaked open before she touched it. In the dark, two pale eyes stared from behind a stack of boxes, and Mara held her breath.",
   "A small black cat padded into the moonlight and brushed against her ankle. Mara let out a laugh. The warm glow of a night-light filled the attic, and the house felt safe again.",
 ];
+const wakeGreeting = "Hello, I am LOOB. What can I help you with?";
 
 const wait = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 const sessionDateLabel = () => new Intl.DateTimeFormat("en", { weekday: "short", month: "short", day: "numeric" }).format(new Date());
@@ -44,9 +60,22 @@ function scanError(reason: string) {
   return "This scan was not clear enough to use. Reposition the book and try again.";
 }
 
+const spokenCharacter = /[\p{L}\p{N}]/u;
+
+function cleanSpeechText(text: string) {
+  return text
+    .replace(/^[ \t]*[*_#=~\-]{3,}[ \t]*$/gm, " ")
+    .replace(/\*+/g, "")
+    .replace(/`+/g, "")
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function speechChunks(text: string) {
   const chunks: string[] = [];
-  let remaining = text.trim();
+  let remaining = cleanSpeechText(text);
+  if (!spokenCharacter.test(remaining)) return chunks;
   while (remaining.length > 4_500) {
     const space = remaining.lastIndexOf(" ", 4_500);
     const end = space > 3_000 ? space : 4_500;
@@ -78,6 +107,14 @@ function storyParagraphs(text: string) {
   return grouped;
 }
 
+function wakeRecognitionConstructor() {
+  const browserWindow = window as typeof window & {
+    SpeechRecognition?: WakeRecognitionConstructor;
+    webkitSpeechRecognition?: WakeRecognitionConstructor;
+  };
+  return browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition ?? null;
+}
+
 export function ReadingDesk() {
   const [tab, setTab] = useState<"reader" | "developer">("reader");
   const [lastScan, setLastScan] = useState<{ result: CameraScan; capturedAt: number; durationMs: number } | null>(null);
@@ -105,6 +142,7 @@ export function ReadingDesk() {
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
   const [micPending, setMicPending] = useState(false);
+  const [wakeListening, setWakeListening] = useState(false);
   const [speaking, setSpeaking] = useState<number | null>(null);
   const [pageText, setPageText] = useState(() => initialPassage.join("\n\n"));
   const [pageTitle, setPageTitle] = useState("The Whisper in the Attic");
@@ -118,6 +156,9 @@ export function ReadingDesk() {
   const [pageMoods, setPageMoods] = useState<NarrationMood[] | null>(null);
   const recorder = useRef<MediaRecorder | null>(null);
   const micWorking = useRef(false);
+  const wakeRecognition = useRef<WakeRecognition | null>(null);
+  const wakeListeningRef = useRef(false);
+  const wakeGreetingInProgress = useRef(false);
   const messageSequence = useRef(0);
   const stream = useRef<MediaStream | null>(null);
   const audio = useRef<HTMLAudioElement | null>(null);
@@ -204,6 +245,8 @@ export function ReadingDesk() {
 
   async function play(text: string, id: number) {
     if (scanning || recording || micWorking.current) return;
+    const spokenText = cleanSpeechText(text);
+    if (!spokenCharacter.test(spokenText)) return;
     setToolStatus(null);
     stopAudio();
     const version = playbackVersion.current;
@@ -211,7 +254,7 @@ export function ReadingDesk() {
     speechRequest.current = controller;
     setSpeaking(id);
     try {
-      await playClip(makeSpeech(text, controller.signal), "neutral", controller, version, false);
+      await playClip(makeSpeech(spokenText, controller.signal), "neutral", controller, version, false);
       if (playbackVersion.current === version) stopAudio();
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -448,24 +491,27 @@ export function ReadingDesk() {
     }
   }
 
-  async function toggleMic() {
-    if (recording) { recorder.current?.stop(); return; }
+  async function startMicRecording() {
     if (scanning || busy || micWorking.current) return;
     setToolStatus(null);
     stopAudio();
     if (!navigator.mediaDevices || typeof MediaRecorder === "undefined") { add({ role: "error", text: "This browser does not support microphone questions." }); return; }
     micWorking.current = true;
     setMicPending(true);
+    let microphone: MediaStream | null = null;
     try {
-      const microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+      microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const activeMicrophone = microphone;
       const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(MediaRecorder.isTypeSupported);
-      const mediaRecorder = type ? new MediaRecorder(microphone, { mimeType: type }) : new MediaRecorder(microphone);
+      const mediaRecorder = type ? new MediaRecorder(activeMicrophone, { mimeType: type }) : new MediaRecorder(activeMicrophone);
       const chunks: BlobPart[] = [];
-      stream.current = microphone;
+      stream.current = activeMicrophone;
       recorder.current = mediaRecorder;
       mediaRecorder.ondataavailable = (event) => event.data.size && chunks.push(event.data);
       mediaRecorder.onstop = async () => {
-        microphone.getTracks().forEach((track) => track.stop());
+        activeMicrophone.getTracks().forEach((track) => track.stop());
+        if (stream.current === activeMicrophone) stream.current = null;
+        if (recorder.current === mediaRecorder) recorder.current = null;
         setRecording(false);
         const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
         if (!blob.size) { add({ role: "error", text: "I did not hear anything. Please try again." }); return; }
@@ -485,6 +531,7 @@ export function ReadingDesk() {
       mediaRecorder.start();
       setRecording(true);
     } catch {
+      microphone?.getTracks().forEach((track) => track.stop());
       add({ role: "error", text: "Microphone permission is off. You can still type a question." });
     } finally {
       micWorking.current = false;
@@ -492,7 +539,113 @@ export function ReadingDesk() {
     }
   }
 
-  useEffect(() => () => { stopAudio(); stream.current?.getTracks().forEach((track) => track.stop()); }, []);
+  function stopWakeListening() {
+    wakeListeningRef.current = false;
+    setWakeListening(false);
+    const recognition = wakeRecognition.current;
+    wakeRecognition.current = null;
+    recognition?.abort();
+  }
+
+  async function greetAndRecord() {
+    if (wakeGreetingInProgress.current || scanning || busy || recording || micWorking.current) return;
+    wakeGreetingInProgress.current = true;
+    setToolStatus(null);
+    stopAudio();
+    const version = playbackVersion.current;
+    const controller = new AbortController();
+    speechRequest.current = controller;
+    setSpeaking(-1);
+    try {
+      const greetingFinished = await playClip(
+        makeSpeech(wakeGreeting, controller.signal), "neutral", controller, version, false,
+      );
+      if (!greetingFinished || controller.signal.aborted || playbackVersion.current !== version) return;
+      setSpeaking(null);
+      speechRequest.current = null;
+      await startMicRecording();
+    } catch (error) {
+      if (controller.signal.aborted || playbackVersion.current !== version) return;
+      add({ role: "notice", text: error instanceof LoobError ? error.message : "LOOB could not prepare its greeting." });
+    } finally {
+      if (playbackVersion.current === version) {
+        setSpeaking(null);
+        speechRequest.current = null;
+      }
+      wakeGreetingInProgress.current = false;
+    }
+  }
+
+  function toggleWakeListening() {
+    if (wakeListening) {
+      stopWakeListening();
+      return;
+    }
+    if (scanning || busy || recording || micWorking.current) return;
+    const Recognition = wakeRecognitionConstructor();
+    if (!Recognition) {
+      add({ role: "error", text: "Wake listening is available in Chrome or Edge. You can still use the microphone button." });
+      return;
+    }
+    const recognition = new Recognition();
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+    recognition.onresult = (event) => {
+      for (let index = event.results.length - 1; index >= 0; index--) {
+        const transcript = event.results[index][0]?.transcript ?? "";
+        if (!/\bloob\b/i.test(transcript)) continue;
+        wakeListeningRef.current = false;
+        setWakeListening(false);
+        if (wakeRecognition.current === recognition) wakeRecognition.current = null;
+        recognition.stop();
+        logEvent("voice", 'Wake word "LOOB" heard');
+        void greetAndRecord();
+        return;
+      }
+    };
+    recognition.onerror = (event) => {
+      if (event.error !== "not-allowed" && event.error !== "service-not-allowed") return;
+      stopWakeListening();
+      add({ role: "error", text: "Microphone permission is needed to listen for LOOB." });
+    };
+    recognition.onend = () => {
+      if (wakeRecognition.current !== recognition || !wakeListeningRef.current) return;
+      window.setTimeout(() => {
+        if (wakeRecognition.current !== recognition || !wakeListeningRef.current) return;
+        try {
+          recognition.start();
+        } catch {
+          stopWakeListening();
+          add({ role: "error", text: "LOOB could not keep wake listening active. Arm it again to retry." });
+        }
+      }, 200);
+    };
+    wakeRecognition.current = recognition;
+    wakeListeningRef.current = true;
+    setWakeListening(true);
+    setToolStatus({ text: 'Listening for “LOOB”. Say “LOOB” to ask a question.', error: false });
+    try {
+      recognition.start();
+    } catch {
+      stopWakeListening();
+      add({ role: "error", text: "LOOB could not start wake listening. Check microphone permission and try again." });
+    }
+  }
+
+  async function toggleMic() {
+    if (recording) { recorder.current?.stop(); return; }
+    stopWakeListening();
+    await startMicRecording();
+  }
+
+  useEffect(() => () => {
+    wakeListeningRef.current = false;
+    wakeRecognition.current?.abort();
+    wakeRecognition.current = null;
+    stopAudio();
+    stream.current?.getTracks().forEach((track) => track.stop());
+  }, []);
   useEffect(() => { if (tab === "reader") journalEnd.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, [messages, tab]);
   function send(event: FormEvent) { event.preventDefault(); void submit(input); }
   const paragraphs = storyParagraphs(pageText);
@@ -536,8 +689,9 @@ export function ReadingDesk() {
             <div className="reader-mode"><span>Mode: <strong>{tracker.applied && tracker.data?.applied_blink_only ? scanning ? "Blink test · scan in progress" : "Blink test · ready" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused · gaze to restart" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
             <div className="journal-toolbar">
               <h2 className="journal-heading">Voice log</h2>
+              <button className={`notebook-button wake-button${wakeListening ? " listening" : ""}`} type="button" disabled={!wakeListening && (controlsBusy || scanning || recording)} onClick={toggleWakeListening} aria-pressed={wakeListening}>{wakeListening ? "Listening for LOOB" : "Call LOOB"}</button>
               <button className={`icon-button reader-mic${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"} aria-pressed={recording} title={recording ? "Stop recording" : "Ask with your voice"}><DeskIcon name={recording ? "stop" : "mic"} width="19" height="19" /></button>
-              {recording && <span className="listening-note" role="status">listening…</span>}
+              {(recording || wakeListening) && <span className="listening-note" role="status">{recording ? "listening…" : 'say “LOOB”'}</span>}
             </div>
             <form className="reader-composer" onSubmit={send}>
               <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask about this page…" aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />

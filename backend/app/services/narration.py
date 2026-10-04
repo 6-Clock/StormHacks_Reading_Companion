@@ -22,6 +22,10 @@ EFFECT_PATTERNS = {
     ),
 }
 MAX_CUES_PER_PARAGRAPH = 2
+CLAUSE_BOUNDARIES = re.compile(r"[;,]|\b(?:but|however|yet)\b", re.IGNORECASE)
+NEGATION_PATTERN = re.compile(
+    r"\b(?:no|not|never|without|neither|nor)\b|\b\w+n['’]t\b", re.IGNORECASE,
+)
 
 SUSPENSE_WORDS = frozenset(
     ("afraid", "blood", "creak", "creepy", "dark", "fear", "footsteps", "frightened",
@@ -74,13 +78,17 @@ def split_sentences(paragraph: str) -> list[str]:
 
 
 def fallback_cues(sentences: list[list[str]]) -> list[dict[str, int | str]]:
-    """Use a few literal sound events even when the classifier is offline."""
+    """Use keyword cues offline, conservatively skipping clauses with obvious negation."""
     cues: list[dict[str, int | str]] = []
     for paragraph_index, paragraph_sentences in enumerate(sentences):
         count = 0
         for sentence_index, sentence in enumerate(paragraph_sentences):
+            affirmative_clauses = [
+                clause for clause in CLAUSE_BOUNDARIES.split(sentence)
+                if not NEGATION_PATTERN.search(clause)
+            ]
             for effect, pattern in EFFECT_PATTERNS.items():
-                if pattern.search(sentence):
+                if any(pattern.search(clause) for clause in affirmative_clauses):
                     cues.append(
                         {
                             "paragraph_index": paragraph_index,
@@ -151,22 +159,6 @@ def combine_cues(
     fallback: list[dict[str, int | str]],
     suggested: list[dict[str, int | str]] | None,
 ) -> list[dict[str, int | str]]:
-    """Keep deterministic cues and add validated AI suggestions without duplicates."""
-    result = list(fallback)
-    if suggested is None:
-        return result
-    for cue in suggested:
-        paragraph_index = cue["paragraph_index"]
-        if any(
-            existing["paragraph_index"] == paragraph_index
-            and existing["sentence_index"] == cue["sentence_index"]
-            for existing in result
-        ):
-            continue
-        if (
-            sum(existing["paragraph_index"] == paragraph_index for existing in result)
-            >= MAX_CUES_PER_PARAGRAPH
-        ):
-            continue
-        result.append(cue)
+    """Honor validated AI cues, including silence; fall back only when unavailable."""
+    result = fallback if suggested is None else suggested
     return sorted(result, key=lambda cue: (cue["paragraph_index"], cue["sentence_index"]))

@@ -51,6 +51,11 @@ def _open_scan_camera(engine: ModuleType, camera_index: int) -> Any:
     )
 
 
+def _orient_ocr_frame(engine: ModuleType, frame: Any) -> Any:
+    """Correct the OCR camera's upside-down mounting for preview and OCR."""
+    return engine.cv2.flip(frame, -1)
+
+
 def _live_preview_frame(engine: ModuleType, frame: Any, captured_at: float) -> dict[str, Any]:
     """Encode a bounded browser preview without altering the original OCR frame."""
     height, width = frame.shape[:2]
@@ -101,6 +106,7 @@ def _capture_with_calibration_preview(
                     f"Camera {camera_index} did not return a frame. "
                     "Check the connection and selected camera index."
                 )
+            frame = _orient_ocr_frame(engine, frame)
             if not framing_announced:
                 if progress:
                     instruction = "Frame the page in the live preview, then click Capture now."
@@ -242,6 +248,7 @@ def scan_camera(
             "capture_preview": None,
         }
 
+    frames = [_orient_ocr_frame(engine, frame) for frame in frames]
     _check_cancel(cancel_event)
     if not openai_api_key or not openai_model:
         raise RuntimeError(

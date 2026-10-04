@@ -83,7 +83,19 @@ For hands-free capture, start the tracker with `--camera 1 --ocr-camera 2`. Thre
 | Real three-blink page turn | At least 8 seconds after the command is sent | Captures automatically without a calibration window |
 | **Test 3 blinks** | 8 seconds after the simulated blink sequence | Captures automatically; sends no page-flipper command |
 
-Use `--ocr-settle-seconds 10` for a longer wait; the supported range is 8–30 seconds. The server enforces the eight-second minimum for page turns and blink tests even if an older tracker requests a shorter delay. Connect the page flipper with `--port COM3` (or its actual port); without a port, serial commands are previewed in the terminal. The two camera indexes must be different.
+Use `--ocr-settle-seconds 10` for a longer wait; the supported range is 8–30 seconds. The server enforces the eight-second minimum for page turns and blink tests even if an older tracker requests a shorter delay. Connect the page flipper with `--port COM3` (or its actual port); without a port, UART commands are previewed in the terminal. The two camera indexes must be different.
+
+### STM32 USB-to-TTL page-turn output
+
+After a confirmed page turn, LOOB maps its internal `flip right` action to the exact ASCII UART frame `50\n` (`0x35 0x30 0x0A`). It uses `115200` baud, 8 data bits, no parity, 1 stop bit, and no flow control by default. Run the tracker with the USB-to-TTL adapter's COM port:
+
+```powershell
+python ".\backend\computer vision\eyetracking_opencv.py" --camera 1 --ocr-camera 2 --port COM3 --baud 115200
+```
+
+Wire the adapter's **TXD** to the selected STM32 USART **RX**, and adapter **GND** to STM32 **GND**. Use 3.3 V UART logic; do not feed a 5 V adapter TX signal into STM32 RX. This is a one-way connection, so leave adapter RX and STM32 TX disconnected unless you later add a separate return protocol. Do not connect VCC unless the adapter is intentionally and safely powering the board.
+
+The STM32 must use the same 115200 8N1 settings and treat LF as the end of the ASCII text `50`. A successful Python write means the USB serial driver accepted the bytes; it does not prove the STM32 or page-turn mechanism completed an action. LOOB logs the sent bytes as `[UART TX ...]` in the tracker terminal. A second serial-terminal app cannot use the same COM port while LOOB owns it.
 
 **Test 3 blinks** can run without the eye tracker or page-flipper hardware. It still opens the selected book camera and runs OCR after the countdown. If eye tracking is running, it uses the same pause-and-resume handoff as a manual scan.
 

@@ -1,6 +1,7 @@
 import unittest
 
 from app.services.narration import (
+    combine_cues,
     fallback_cues,
     fallback_moods,
     parse_cues,
@@ -10,6 +11,30 @@ from app.services.narration import (
 
 
 class NarrationMoodTests(unittest.TestCase):
+    def test_fallback_skips_obviously_negated_events(self) -> None:
+        for sentence in (
+            "There were no footsteps outside.",
+            "The door did not creak.",
+            "The door didn't creak.",
+            "The door didn’t creak.",
+            "Thunder never sounded.",
+            "She waited without a knock on the door.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertEqual(fallback_cues([[sentence]]), [])
+
+    def test_fallback_keeps_affirmative_event_in_separate_clause(self) -> None:
+        self.assertEqual(
+            fallback_cues([["There were no footsteps, but thunder sounded outside."]]),
+            [{"paragraph_index": 0, "sentence_index": 0, "effect": "thunder"}],
+        )
+
+    def test_valid_ai_cues_replace_fallback_even_when_empty(self) -> None:
+        fallback = fallback_cues([["The door creaked.", "Footsteps echoed in the hall."]])
+        self.assertEqual(combine_cues(fallback, []), [])
+        self.assertEqual(combine_cues(fallback, [fallback[1]]), [fallback[1]])
+        self.assertEqual(combine_cues(fallback, None), fallback)
+
     def test_fallback_classifies_scary_and_warm_paragraphs(self) -> None:
         self.assertEqual(
             fallback_moods([

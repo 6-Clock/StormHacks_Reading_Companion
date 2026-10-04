@@ -1081,6 +1081,8 @@ p,h1,h2,h3 {
   box-shadow: none;
 }
 .reader-mic.recording { background-color: #a4483712; }
+.wake-button { font-size: 11px; min-height: 32px; padding: 6px 9px; color: var(--green); }
+.wake-button.listening { color: #405630; border-color: var(--green); background: #d8e2b71c; }
 .reader-composer {
   display: flex;
   align-items: center;

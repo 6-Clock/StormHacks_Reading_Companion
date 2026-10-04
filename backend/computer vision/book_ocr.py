@@ -281,6 +281,7 @@ Do not use any text source other than the image.
     try:
         response = OpenAI(api_key=api_key, timeout=45.0, max_retries=0).responses.create(
             model=model,
+            reasoning={"effort": "low"},
             store=False,
             input=[
                 {
@@ -327,6 +328,7 @@ FIRST VISION TRANSCRIPTION:
     try:
         response = OpenAI(api_key=api_key, timeout=45.0, max_retries=0).responses.create(
             model=model,
+            reasoning={"effort": "low"},
             store=False,
             input=[
                 {
