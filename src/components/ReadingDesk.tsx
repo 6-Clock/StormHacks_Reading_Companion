@@ -481,7 +481,7 @@ export function ReadingDesk() {
           <section className="notebook-page right-page story-page" aria-label="Story">
             <header className="story-heading">
               <span className="page-kicker">{pageScanned ? "Scanned page" : "01 · Story"}</span>
-              <div className="story-heading-actions"><span className="word-count">{wordCount} words</span><button className="notebook-button reader-read" type="button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy} aria-label={speaking !== null ? "Stop audio" : "Read story"}><DeskIcon name={speaking !== null ? "stop" : "play"} width="14" height="14" />{speaking !== null ? "Stop" : "Read"}</button></div>
+              <div className="story-heading-actions"><span className="word-count">{wordCount} words</span><button className="notebook-button reader-read" type="button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy} aria-label={speaking !== null ? "Stop audio" : "Read story"}>{speaking !== null ? "Stop" : "Read"}</button></div>
             </header>
             <article className="story-text" aria-label="Story text" tabIndex={0}>
               {paragraphs.map((paragraph, index) => <p key={`${index}-${paragraph}`} className={`story-paragraph${activeParagraph === index ? " active" : ""}`}>{passageText(paragraph)}</p>)}
@@ -499,7 +499,7 @@ export function ReadingDesk() {
             <section className="reader-tools" aria-labelledby="reader-tools-heading">
               <h3 id="reader-tools-heading">Reader controls</h3>
               <div className="narration-actions">
-                <button className="notebook-button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy}><DeskIcon name={speaking !== null ? "stop" : "play"} width="13" height="13" />{speaking !== null ? "Stop audio" : "Read page"}</button>
+                <button className="notebook-button" onClick={() => speaking !== null ? stopAudio() : void narratePage(0, true)} disabled={scanning || recording || controlsBusy}>{speaking !== null ? "Stop audio" : "Read page"}</button>
                 {latestAnswer && <button className="text-button" onClick={() => void play(latestAnswer.text, latestAnswer.id)} disabled={scanning || recording || controlsBusy}>Replay answer</button>}
               </div>
               <div className="sound-settings">

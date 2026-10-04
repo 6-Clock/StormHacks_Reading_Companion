@@ -17,7 +17,7 @@
 body {
   margin: 0;
   color: var(--ink);
-  background: #2D2D2D;
+  background: #111111;
   font-family: var(--font-sans),Arial,sans-serif;
 }
 
@@ -67,11 +67,12 @@ p,h1,h2,h3 {
   clip: rect(0,0,0,0);
   white-space: nowrap;
   border: 0;
+  border-radius: 2px;
 }
 
 .reading-workspace {
   min-height: 100svh;
-  background: #2D2D2D;
+  background: #111111;
   padding: 28px 0 20px;
 }
 
@@ -227,7 +228,7 @@ p,h1,h2,h3 {
 
 .page-kicker {
   margin-bottom: 5px;
-  color: #7e7c67;
+  color: #111111;
   font-size: 10px;
   letter-spacing: .16em;
   text-transform: uppercase;
@@ -235,18 +236,19 @@ p,h1,h2,h3 {
 }
 
 .page-heading h1 {
-  font-size: clamp(16px,1.65vw,24px);
+  font-size: clamp(20px,2vw,30px);
   line-height: 1.16;
   letter-spacing: -.025em;
   font-weight: 670;
   text-transform: uppercase;
-  margin: 0 0 6px;
+  margin: 0 0 3px;
+  color: #111111;
 }
 
 .page-subtitle {
   margin: 0;
   font-size: 14px;
-  color: #655f50;
+  color: #111111;
 }
 
 .reader-mode {
@@ -320,7 +322,11 @@ p,h1,h2,h3 {
   height: 42px;
   padding: 0;
   border: 0;
-  background: transparent;
+  background-color: transparent;
+  background-image: url("../assets/white button.png");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 145% 145%;
   color: #827f67;
   filter: drop-shadow(1px 1px 0 #fff9);
   flex: 0 0 auto;
@@ -347,8 +353,8 @@ p,h1,h2,h3 {
   margin-top: 23px;
   padding-top: 8px;
   min-height: 31px;
-  font-size: 11px;
-  color: #625e4d;
+  font-size: 12px;
+  color: #111111;
 }
 
 .page-footer>span {
@@ -382,7 +388,7 @@ p,h1,h2,h3 {
 
 .word-count {
   font-family: var(--font-mono),monospace;
-  color: #918d79;
+  color: #111111;
   font-size: 10px;
 }
 
@@ -441,9 +447,13 @@ p,h1,h2,h3 {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px solid #87956588;
-  border-radius: 4px;
-  background: #b7c69166;
+  border: 0;
+  border-radius: 0;
+  background-color: #b7c69166;
+  background-image: linear-gradient(#b7c69124,#b7c69124),url("../assets/bookmark_with_no_wrinkle.png");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 115% 145%;
   padding: 8px 13px;
   font-size: 12px;
   font-weight: 550;
@@ -451,7 +461,8 @@ p,h1,h2,h3 {
 }
 
 .read-button:hover,.notebook-button:hover {
-  background: #b7c691a0;
+  background-color: #b7c691a0;
+  background-image: linear-gradient(#b7c69152,#b7c69152),url("../assets/bookmark_with_no_wrinkle.png");
 }
 
 .text-button {
@@ -586,18 +597,18 @@ p,h1,h2,h3 {
 
 .appendix-heading h1,.appendix-heading h2 {
   text-transform: uppercase;
-  font-size: 25px;
+  font-size: 30px;
   font-weight: 600;
   line-height: 1.03;
-  margin: 3px 0 7px;
-  color: #512d22;
+  margin: 3px 0 1px;
+  color: #111111;
   letter-spacing: -.03em;
 }
 
 .appendix-heading p {
   margin: 0;
   font-size: 12px;
-  color: #7c715d;
+  color: #111111;
 }
 
 .status-reading {
@@ -671,7 +682,7 @@ p,h1,h2,h3 {
 
 .developer-page .page-footer {
   margin-top: 14px;
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .connection-label {
@@ -701,8 +712,8 @@ p,h1,h2,h3 {
 .developer-scan-controls input {
   width: 42px;
   padding: 5px;
-  border: 1px solid #aaa887;
-  border-radius: 3px;
+  border: 0;
+  border-radius: 2px;
   background: #f9f3df44;
 }
 
@@ -830,7 +841,7 @@ p,h1,h2,h3 {
   }
 
   .page-footer {
-    font-size: 10px;
+    font-size: 11px;
   }
 
   .appendix-heading {
@@ -838,7 +849,7 @@ p,h1,h2,h3 {
   }
 
   .appendix-heading h1,.appendix-heading h2 {
-    font-size: 21px;
+    font-size: 25px;
   }
 }
 
@@ -1059,19 +1070,24 @@ p,h1,h2,h3 {
 .reader-mic {
   width: 36px;
   height: 36px;
-  border: 1px solid #87956580;
-  border-radius: 50%;
-  background: #b7c69126;
+  border: 0;
+  border-radius: 2px;
+  background-color: #f4efe2;
+  background-image: url("../assets/white button.png");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 145% 145%;
   color: var(--green);
+  box-shadow: none;
 }
-.reader-mic.recording { border-color: #a44837; background: #a4483712; }
+.reader-mic.recording { background-color: #a4483712; }
 .reader-composer {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
   margin: 8px 0 16px;
-  border-bottom: 1px solid #a19e8790;
+  border-bottom: 1px solid #111;
 }
 .reader-composer input {
   flex: 1;
@@ -1171,14 +1187,15 @@ p,h1,h2,h3 {
 .word-note-content p { margin: 0; }
 
 /* Appendix: compact diagnostics and manual controls stay on the paper. */
-.developer-page { font-family: var(--font-mono), monospace; }
+.developer-page { font-family: var(--font-sans), Arial, sans-serif; }
 .developer-page .appendix-heading { flex-shrink: 0; }
 .developer-body { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; padding-right: 5px; }
 .developer-page .page-footer { flex-shrink: 0; }
 .developer-page .appendix-heading h1, .developer-page .appendix-heading h2 { font-family: var(--font-sans), sans-serif; }
-.developer-page .appendix-heading p { font-size: 11px; }
+.developer-page .appendix-heading p { font-size: 14px; line-height: 1.2; }
 .eye-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 23px 18px; }
 .eye-metrics dd { font-size: 16px; }
+.eye-metrics dt, .eye-metrics dd { color: #111111; }
 .capture-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .capture-status { font-size: 10px; color: #8c493b; }
 .capture-status.status-reading { color: var(--green); }
@@ -1192,19 +1209,63 @@ p,h1,h2,h3 {
 .scan-photo-empty { display: grid; place-items: center; height: 132px; border: 1px dashed #96917a; border-radius: 3px; color: #79715c; font-size: 11px; background: #60583b08; }
 .scan-preview-caption { font-size: 9px; color: #7e715b; margin-top: 7px; }
 .reader-tools { border-top: 1px solid var(--rule); padding-top: 14px; margin-top: 16px; }
-.reader-tools h3, .command-log h3 { font: 500 11px/1.4 var(--font-mono), monospace; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 12px; }
+.reader-tools h3 { font: 500 11px/1.4 var(--font-sans), Arial, sans-serif; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 12px; }
+.command-log h3 { font: 500 11px/1.4 var(--font-mono), monospace; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 12px; }
 .reader-tools .notebook-button, .reader-tools .text-button { font-size: 10px; padding: 6px 9px; }
 .reader-tools .sound-settings { margin-top: 10px; }
 .reader-tools .immersive-toggle { font-size: 10px; }
-.developer-composer { display: flex; align-items: center; margin-top: 14px; border: 1px solid #b2ab91; border-radius: 3px; gap: 5px; background: #fffaf122; }
+.developer-composer { display: flex; align-items: center; margin-top: 14px; border: 0; border-radius: 2px; gap: 5px; background: #fffaf122; }
 .developer-composer input { flex: 1; min-width: 0; width: 100%; background: none; border: 0; font: 11px var(--font-mono), monospace; color: var(--blue-ink); height: 36px; }
 .developer-composer input::placeholder { color: #7c755f; }
-.developer-composer .icon-button { width: 30px; height: 36px; }
+.developer-composer .icon-button { width: 32px; height: 32px; border: 0; border-radius: 2px; box-shadow: none; background-size: 165% 165%; }
 .tool-status, .narration-moods { font-size: 10px; line-height: 1.6; color: #71674e; margin: 9px 0 0; overflow-wrap: anywhere; }
 .tool-status.is-error { color: #914333; }
 .command-log { margin-top: 20px; min-height: 70px; }
 .command-events { max-height: 180px; }
 .empty-log { font: 11px/1.6 var(--font-mono), monospace; color: #79715c; }
+
+/* UI labels use Google Sans Flex; the command log keeps its terminal-style mono face. */
+.story-heading,
+.story-heading .word-count,
+.story-page .page-footer,
+.journal-page .page-heading,
+.journal-page .journal-heading,
+.journal-page .page-footer,
+.developer-page .gaze-label,
+.developer-page .diagnostic-metrics dd,
+.developer-page .scan-reason,
+.developer-page .sound-volume output,
+.developer-page .developer-composer input {
+  font-family: var(--font-sans), Arial, sans-serif;
+}
+
+.command-log,
+.command-log h3,
+.command-log .command-event,
+.command-log .empty-log {
+  font-family: var(--font-mono), monospace;
+}
+
+.developer-page .page-footer .connection-label,
+.developer-page .page-footer .connection-label.is-connected {
+  color: #111111;
+}
+
+.reader-tools,
+.reader-tools h3,
+.reader-tools .text-button,
+.reader-tools .immersive-toggle,
+.reader-tools .sound-volume,
+.reader-tools .sound-volume output,
+.developer-composer input,
+.developer-composer input::placeholder,
+.command-log,
+.command-log h3,
+.command-log .command-event,
+.command-log .command-event time,
+.command-log .empty-log {
+  color: #111111;
+}
 
 @media (max-width: 760px) {
   .journal-page { min-height: 540px; }
