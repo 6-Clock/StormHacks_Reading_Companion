@@ -1,43 +1,34 @@
-<<<<<<< HEAD
-from fastapi import FastAPI
-
-from app.api.router import api_router
-from app.core.config import settings
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title=settings.app_name,
-        version="0.1.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-    )
-    app.include_router(api_router, prefix=settings.api_prefix)
-    return app
-
-
-app = create_app()
-=======
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
+from app.api.router import api_router
+from app.core.config import settings as core_settings
+from app.services.book_scanner import scan_camera
+
 from .config import settings
 
 
-app = FastAPI(title="LOOB Reading Companion API")
+app = FastAPI(
+    title="LOOB Reading Companion API",
+    version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.allowed_origin],
+    allow_origins=list(settings.allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(api_router, prefix=core_settings.api_prefix)
 
 
 class Question(BaseModel):
@@ -47,6 +38,11 @@ class Question(BaseModel):
 
 class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=5_000)
+
+
+class CameraScanRequest(BaseModel):
+    camera_index: int = Field(default=1, ge=0, le=10)
+    show_preview: bool = True
 
 
 def require_openai_key() -> None:
@@ -62,6 +58,22 @@ def require_elevenlabs() -> None:
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.post("/v1/scan-camera")
+async def scan_book_page(request: CameraScanRequest) -> dict[str, object]:
+    """Scan a physical book page and return it only after the OCR quality gate passes."""
+    try:
+        return await run_in_threadpool(
+            scan_camera,
+            request.camera_index,
+            openai_api_key=settings.openai_api_key,
+            openai_model=settings.openai_ocr_model,
+            openai_revision_model=settings.openai_ocr_review_model,
+            show_preview=request.show_preview,
+        )
+    except RuntimeError as error:
+        raise HTTPException(503, str(error)) from error
 
 
 @app.post("/v1/ask")
@@ -157,4 +169,3 @@ async def speech(request: SpeechRequest) -> Response:
         raise HTTPException(502, "LOOB could not reach ElevenLabs.") from error
 
     return Response(content=result.content, media_type="audio/mpeg")
->>>>>>> origin/reading-companion

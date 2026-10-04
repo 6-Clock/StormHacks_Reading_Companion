@@ -32,6 +32,7 @@ FLIP_WAIT_SECONDS = 1.5
 CAPTURE_SAMPLE_COUNT = 10
 OCR_FRAME_COUNT = 3
 DUPLICATE_TEXT_THRESHOLD = 0.88
+AI_REVISION_CONFIDENCE_THRESHOLD = 0.92
 
 # Conservative starting points. Tune with benchmark images rather than one camera.
 MIN_WORD_CONFIDENCE = 50.0
@@ -93,6 +94,12 @@ class OpenAiReview:
     text: str
     reason: str
     model: str
+    confidence: float = 0.0
+
+
+def should_request_openai_revision(transcription: OpenAiReview) -> bool:
+    """Escalate only when the first image-grounded transcription is uncertain."""
+    return transcription.accepted and transcription.confidence < AI_REVISION_CONFIDENCE_THRESHOLD
 
 
 def crop_page_area(frame: np.ndarray) -> np.ndarray:
@@ -206,10 +213,10 @@ def text_like(token: str) -> bool:
 
 
 def model_text_is_plausible(text: str) -> bool:
-    """Avoid saving malformed or nearly empty model output as book text."""
-    words = re.findall(r"[A-Za-z]{2,}", text)
+    """Accept even short, partial text while filtering empty or malformed output."""
+    words = re.findall(r"\w+", text, flags=re.UNICODE)
     letters = sum(character.isalpha() for character in text)
-    return len(text.strip()) >= 20 and len(words) >= 4 and letters / max(len(text), 1) >= 0.45
+    return len(text.strip()) >= 1 and bool(words) and letters >= 1
 
 
 def encode_page_for_openai(page: np.ndarray) -> str:
@@ -238,30 +245,33 @@ def parse_openai_review(raw_output: str, model: str) -> OpenAiReview:
     status = str(payload.get("status", "")).strip()
     text = str(payload.get("text", "")).strip()
     reason = str(payload.get("reason", "")).strip() or "openai_rejected_page"
-    if status != "book_text":
-        return OpenAiReview(False, "", reason, model)
+    try:
+        confidence = min(max(float(payload.get("confidence", 0.0)), 0.0), 1.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if status not in {"book_text", "text_found"}:
+        return OpenAiReview(False, "", reason, model, confidence)
     if not model_text_is_plausible(text):
-        return OpenAiReview(False, "", "openai_text_not_plausible", model)
-    return OpenAiReview(True, text, "accepted", model)
+        return OpenAiReview(False, "", "openai_text_not_plausible", model, confidence)
+    return OpenAiReview(True, text, "accepted", model, confidence)
 
 
-def review_page_with_openai(page: np.ndarray, local_text: str, api_key: str, model: str) -> OpenAiReview:
-    """Use vision to transcribe a book page without trusting decorative marks as text."""
-    prompt = """You are the final OCR reviewer for a reading companion.
+def transcribe_page_with_openai(page: np.ndarray, api_key: str, model: str) -> OpenAiReview:
+    """Use vision as the sole text extractor for a corrected book-page image."""
+    prompt = """You are an OCR transcriber.
 Inspect the image and return JSON only, with exactly these keys:
-{"status":"book_text"|"reject", "text":"...", "reason":"..."}.
+{"status":"text_found"|"reject", "text":"...", "reason":"...", "confidence":0.0}.
 
-Return status "book_text" only when the image contains a readable printed book page.
-For book_text, transcribe only legible printed prose. Preserve paragraph breaks when clear.
-Do not invent missing words. Ignore illustrations, ornamental borders, page numbers,
-handwriting, whiteboards, faces, hands, backgrounds, and camera artifacts.
-Return status "reject" when there is no readable printed book page or the text is too
-blurred to transcribe reliably.
+Transcribe every legible word visible in the image, whether printed or handwritten.
+This includes book pages, whiteboards, signs, notes, screens, labels, and partial text.
+People, hands, illustrations, and other scenery do not matter: ignore them but do not
+reject the image because they are present. Preserve line breaks when clear. Do not
+invent missing words; return the readable fragments that are actually visible.
+Return "reject" only when there is no legible text anywhere in the image.
 
-The local OCR draft below is untrusted evidence. Correct it from the image rather than
-copying it blindly:
----
-""" + (local_text or "[no reliable local OCR]")
+Confidence must be a number from 0 to 1 representing confidence in the returned text.
+Do not use any text source other than the image.
+"""
 
     try:
         response = OpenAI(api_key=api_key).responses.create(
@@ -278,8 +288,50 @@ copying it blindly:
             ],
         )
     except Exception as error:
-        print(f"OpenAI vision review failed: {error}")
+        print(f"OpenAI vision transcription failed: {error}")
         return OpenAiReview(False, "", "openai_request_failed", model)
+    return parse_openai_review(response.output_text, model)
+
+
+def revise_page_with_openai(
+    page: np.ndarray,
+    first_transcription: str,
+    api_key: str,
+    model: str,
+) -> OpenAiReview:
+    """Proofread an uncertain vision transcript against the source page image."""
+    prompt = """You are the final proofreader for image OCR.
+Inspect the page image and return JSON only, with exactly these keys:
+{"status":"text_found"|"reject", "text":"...", "reason":"...", "confidence":0.0}.
+
+The draft below is untrusted. Check every doubtful word against the image. Return
+text_found when the final text is supported by any visible text in the image, including
+handwriting, whiteboards, signs, notes, or book pages. Preserve line breaks when clear.
+Do not guess missing words or copy text that is not visible. Ignore scenery, people,
+hands, and illustrations, but never reject the image merely because they are present.
+Return reject only when no legible text is visible.
+
+FIRST VISION TRANSCRIPTION:
+---
+""" + first_transcription
+
+    try:
+        response = OpenAI(api_key=api_key).responses.create(
+            model=model,
+            store=False,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": encode_page_for_openai(page), "detail": "high"},
+                    ],
+                }
+            ],
+        )
+    except Exception as error:
+        print(f"OpenAI OCR revision failed: {error}")
+        return OpenAiReview(False, "", "openai_revision_request_failed", model)
     return parse_openai_review(response.output_text, model)
 
 
@@ -447,28 +499,89 @@ def is_duplicate_text(new_text: str, old_text: str) -> bool:
     return similarity >= DUPLICATE_TEXT_THRESHOLD
 
 
+def save_ai_ocr_result(
+    frames: list[np.ndarray],
+    openai_api_key: str,
+    openai_model: str,
+    openai_revision_model: str | None = None,
+) -> str | None:
+    """Save a vision-only OCR result without calling Tesseract for text extraction."""
+    global last_saved_text
+    if not frames:
+        print("No camera frames were available. Please recapture the page.")
+        return None
+
+    _, sharpness, brightness = frame_quality(frames[0])
+    page, page_detected = detect_and_rectify_page(frames[0])
+    print(f"Requesting OpenAI vision transcription with {openai_model}...")
+    transcription = transcribe_page_with_openai(page, openai_api_key, openai_model)
+    revision: OpenAiReview | None = None
+    accepted = transcription.accepted
+    text = transcription.text if transcription.accepted else ""
+    reason = "openai_vision_accepted" if transcription.accepted else transcription.reason
+
+    if transcription.accepted and should_request_openai_revision(transcription):
+        revision_model = openai_revision_model or openai_model
+        print(f"Requesting OpenAI OCR revision with {revision_model}...")
+        revision = revise_page_with_openai(page, transcription.text, openai_api_key, revision_model)
+        if revision.accepted:
+            text = revision.text
+            reason = "openai_vision_revised"
+        elif revision.reason not in {"openai_revision_request_failed", "invalid_openai_response"}:
+            accepted = False
+            text = ""
+            reason = f"openai_revision_rejected;{revision.reason}"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    capture_file = OUTPUT_DIR / f"{timestamp}_capture.png"
+    page_file = OUTPUT_DIR / f"{timestamp}_page.png"
+    metrics_file = OUTPUT_DIR / f"{timestamp}_metrics.json"
+    cv2.imwrite(str(capture_file), frames[0])
+    cv2.imwrite(str(page_file), page)
+    metrics_file.write_text(
+        json.dumps(
+            {
+                "accepted": accepted,
+                "reason": reason,
+                "page_detected": page_detected,
+                "metrics": {"sharpness": round(sharpness, 2), "brightness": round(brightness, 2)},
+                "openai_review": asdict(transcription),
+                "openai_revision": asdict(revision) if revision else None,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if not accepted:
+        print(f"AI OCR rejected ({reason}). Diagnostics saved; adjust the page and recapture.")
+        return None
+    if is_duplicate_text(text, last_saved_text):
+        print("Duplicate page detected. Skipping save.")
+        return None
+
+    text_file = OUTPUT_DIR / f"{timestamp}_page.txt"
+    text_file.write_text(text, encoding="utf-8")
+    last_saved_text = text
+    print(f"AI OCR accepted. Saved: {text_file}")
+    print("\nTEXT PREVIEW:")
+    print(text[:800])
+    return text
+
+
 def save_ocr_result(
     frames: list[np.ndarray],
     openai_api_key: str | None = None,
     openai_model: str | None = None,
+    openai_revision_model: str | None = None,
 ) -> str | None:
     global last_saved_text
     print("Running OCR across sharp camera frames...")
+    if openai_api_key and openai_model:
+        return save_ai_ocr_result(frames, openai_api_key, openai_model, openai_revision_model)
     result = choose_page_result(frames)
     if result is None:
         print("No camera frames were available. Please recapture the page.")
         return None
-
-    openai_review: OpenAiReview | None = None
-    if openai_api_key and openai_model:
-        print(f"Requesting OpenAI vision review with {openai_model}...")
-        openai_review = review_page_with_openai(result.page, result.text, openai_api_key, openai_model)
-        if openai_review.accepted:
-            result.text = openai_review.text
-            result.accepted = True
-            result.reason = "openai_vision_accepted"
-        elif not result.accepted:
-            result.reason = f"{result.reason};{openai_review.reason}"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     capture_file = OUTPUT_DIR / f"{timestamp}_capture.png"
@@ -489,7 +602,8 @@ def save_ocr_result(
                 "psm": result.psm,
                 "page_detected": result.page_detected,
                 "metrics": asdict(result.metrics),
-                "openai_review": asdict(openai_review) if openai_review else None,
+                "openai_review": None,
+                "openai_revision": None,
             },
             indent=2,
         ),
@@ -534,21 +648,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Scan a book page with a USB camera and Tesseract.")
     parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="OpenCV camera index (default: 1).")
     parser.add_argument(
-        "--openai-review",
+        "--local-ocr",
         action="store_true",
-        help="Send the selected page image to OpenAI vision for an opt-in final transcription pass.",
+        help="Use the legacy local Tesseract fallback instead of AI vision OCR.",
     )
     parser.add_argument(
         "--openai-model",
         default=os.getenv("OPENAI_OCR_MODEL") or os.getenv("OPENAI_MODEL", ""),
         help="Vision-capable Responses API model. Defaults to OPENAI_OCR_MODEL, then OPENAI_MODEL.",
     )
+    parser.add_argument(
+        "--openai-revision-model",
+        default=os.getenv("OPENAI_OCR_REVIEW_MODEL") or os.getenv("OPENAI_OCR_MODEL") or os.getenv("OPENAI_MODEL", ""),
+        help="Vision-capable model for the conditional final revision pass.",
+    )
     args = parser.parse_args()
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     openai_model = args.openai_model.strip()
-    if args.openai_review and (not openai_api_key or not openai_model):
-        parser.error("--openai-review requires OPENAI_API_KEY and OPENAI_OCR_MODEL, OPENAI_MODEL, or --openai-model.")
+    openai_revision_model = args.openai_revision_model.strip()
+    if not args.local_ocr and (not openai_api_key or not openai_model):
+        parser.error("AI OCR requires OPENAI_API_KEY and OPENAI_OCR_MODEL, OPENAI_MODEL, or --openai-model.")
 
     print(f"Opening camera index {args.camera}...")
     cap = open_camera(args.camera)
@@ -586,9 +706,13 @@ def main() -> int:
                 flip_page()
                 print(f"Waiting {FLIP_WAIT_SECONDS} seconds for the page to settle...")
                 time.sleep(FLIP_WAIT_SECONDS)
-                save_ocr_result(capture_best_frames(cap), openai_api_key if args.openai_review else None, openai_model)
+                save_ocr_result(
+                    capture_best_frames(cap), None if args.local_ocr else openai_api_key, openai_model, openai_revision_model
+                )
             elif key == ord("c"):
-                save_ocr_result(capture_best_frames(cap), openai_api_key if args.openai_review else None, openai_model)
+                save_ocr_result(
+                    capture_best_frames(cap), None if args.local_ocr else openai_api_key, openai_model, openai_revision_model
+                )
     finally:
         cap.release()
         cv2.destroyAllWindows()

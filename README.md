@@ -4,14 +4,12 @@ LOOB is a reading companion for book passages. Readers can ask questions by text
 
 ## Before running
 
-This checkout currently contains unresolved Git conflict markers in `backend/app/main.py` and `backend/README.md`. Resolve the `<<<<<<<`, `=======`, and `>>>>>>>` sections in those files before starting the web app. The OCR camera program can be run independently.
-
 Prerequisites:
 
 - Node.js 20 or later
 - Python 3.11 or later
 - A USB camera for the computer-vision programs
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) installed and available on `PATH` for the book OCR program
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) only when using the legacy `--local-ocr` troubleshooting fallback
 
 ## Install all project dependencies
 
@@ -34,6 +32,7 @@ Open two PowerShell windows from the repository root.
 ```powershell
 .\backend\.venv\Scripts\Activate.ps1
 # Create backend\.env and add OPENAI_API_KEY, ELEVENLAB_API, and ELEVENLAB_VOICE_ID.
+# Set ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000 if needed.
 Set-Location backend
 python -m uvicorn app.main:app --reload --port 8001
 ```
@@ -46,13 +45,24 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The frontend expects the API at `http://127.0.0.1:8001` unless `NEXT_PUBLIC_API_BASE_URL` is set.
 
+## Scan a physical page into the reading screen
+
+With the FastAPI service and Next.js app running, use **Scan page** above the story. A local **LOOB OCR calibration** window opens. Select the USB camera index (normally `1`), center the book page inside the yellow guide, then press **C** in that camera window to capture it; press **Q** or Escape to cancel. A successful scan replaces the displayed passage; paragraph playback and LOOB questions then use the scanned text.
+
+The web scanner uses AI vision as its only text extractor. After you press **C** in the calibration window, it sends the selected, perspective-corrected image to OpenAI for transcription. It extracts any legible visible text, including handwritten notes and whiteboards; people and other scenery are ignored rather than causing a rejection. OpenCV is still used only to capture the sharpest frame and correct page perspective; Tesseract text is not used by the reading app.
+
+If a scan is rejected, the Uvicorn terminal logs the configured model plus the AI reason and confidence. This distinguishes a page-quality rejection from an API/model configuration error.
+
+If the first vision transcript reports confidence below 92%, the app makes one additional image-grounded revision request. The revision sees the page image and first transcript, and must reject the scan if it cannot resolve doubtful words from the image. High-confidence first transcripts skip this second request. Set `OPENAI_OCR_MODEL` for transcription and, optionally, `OPENAI_OCR_REVIEW_MODEL` for the final revision; either falls back to `OPENAI_MODEL`.
+
+Close the standalone `book_ocr.py` preview, Windows Camera, Teams, Zoom, and any other program using that camera before scanning from the web app.
+
 ## Run the book OCR camera test
 
 Install the Python dependencies once, then start the OCR program from the repository root:
 
 ```powershell
 .\backend\.venv\Scripts\Activate.ps1
-tesseract --version
 python ".\backend\computer vision\book_ocr.py" --camera 1
 ```
 
@@ -64,11 +74,11 @@ Use `--camera 0` for the laptop camera or `--camera 1` for the first external ca
 
 Before launching, close Teams, Zoom, Discord, the Windows Camera app, and browser tabs that may be using the webcam. In **Settings → Privacy & security → Camera**, allow camera access for desktop apps. If Windows asks for access when the preview opens, allow it.
 
-Results and diagnostics are written to `camera_ocr_output/`. A rejected scan still saves its source frame, corrected page, preprocessing image, word-confidence overlay, and metrics JSON so its failure can be investigated.
+Results and diagnostics are written to `camera_ocr_output/`. AI OCR saves the source frame, corrected image, and metrics JSON; the legacy `--local-ocr` mode also saves preprocessing and word-confidence overlays.
 
-### Optional OpenAI vision review
+### AI vision OCR
 
-The normal OCR pipeline stays local. To request a final OpenAI vision transcription of the selected page, `backend/.env` needs an `OPENAI_API_KEY` plus a vision-capable model in either the existing `OPENAI_MODEL` field or an OCR-specific `OPENAI_OCR_MODEL` field:
+The standalone camera tool uses OpenAI vision as its default text extractor. `backend/.env` needs an `OPENAI_API_KEY` plus a vision-capable model in either the existing `OPENAI_MODEL` field or an OCR-specific `OPENAI_OCR_MODEL` field:
 
 ```powershell
 OPENAI_API_KEY=your_api_key
@@ -78,10 +88,13 @@ OPENAI_OCR_MODEL=your_vision_capable_model  # Optional when OPENAI_MODEL is alre
 Then run:
 
 ```powershell
-python ".\backend\computer vision\book_ocr.py" --camera 1 --openai-review
+python ".\backend\computer vision\book_ocr.py" --camera 1
 ```
 
-The vision pass receives only the selected, corrected page image and the local OCR draft. It is instructed to return text only for a readable printed book page and to reject whiteboards, faces, handwriting, illustrations, and decorative patterns. The request uses `store=False` to avoid persisted Responses application state. It is not a blanket no-retention guarantee; review [OpenAI's data controls](https://developers.openai.com/api/docs/guides/your-data) and do not enable this option for pages you are not authorized to send to OpenAI.
+Use `--openai-revision-model <model>` to override the second-pass model for the standalone camera tool.
+Use `--local-ocr` only when you need the legacy offline Tesseract fallback for troubleshooting.
+
+The vision pass receives only the selected, corrected image and returns any legible visible text, including handwriting and whiteboard notes. It ignores people and surrounding scenery rather than rejecting the scan because they are present. The request uses `store=False` to avoid persisted Responses application state. It is not a blanket no-retention guarantee; review [OpenAI's data controls](https://developers.openai.com/api/docs/guides/your-data) and do not scan material you are not authorized to send to OpenAI.
 
 ## Run the eye-tracking camera program
 
@@ -104,7 +117,7 @@ The eye tracker starts in `STOP` mode. Hold a steady camera gaze for three secon
 
 ## Backend checks
 
-After resolving the merge conflicts, run:
+Run:
 
 ```powershell
 Set-Location backend
