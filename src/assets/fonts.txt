@@ -1,0 +1,8 @@
+<font for handwriting> - Patrick Hand
+
+<font for the general> - Google Sans Flex
+
+<font for the how it works log> - IBM Plex Mono
+
+<font for the book ocr> - Lora
+
