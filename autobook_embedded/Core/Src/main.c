@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
-#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +45,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
+
+TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
@@ -90,6 +91,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM1_Init(void);
 void StartLibraryHandler(void *argument);
 void StartMainTask(void *argument);
 void StartUartTask(void *argument);
@@ -138,6 +140,7 @@ int main(void)
   MX_DMA_Init();
   MX_CAN1_Init();
   MX_USART1_UART_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   if (GM6020_InitBus(1, &hcan1, GM6020_VOLTAGE) != HAL_OK)
   {
@@ -282,6 +285,83 @@ static void MX_CAN1_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 167;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 19999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -347,6 +427,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
 
   /*Configure GPIO pin : PA0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
@@ -483,6 +564,15 @@ void StartMainTask(void *argument)
   bool buttonStable = buttonSample;
   uint32_t buttonChangedMs = HAL_GetTick();
 
+  uint16_t pulse1 = 1000;
+//  uint16_t pulse2 = 1000;
+  uint16_t pulse3 = 2000;
+//  uint16_t pulse4 = 1000;
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Front page gripping servo
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); // Left page holding servo
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); // Right page holding servo
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); // Back page indexing servo
+
   for (;;)
   {
     const uint32_t now = HAL_GetTick();
@@ -497,8 +587,28 @@ void StartMainTask(void *argument)
     {
       buttonStable = buttonSample;
       /* One rearm per press; rejected starts leave the next direction intact. */
-      if (buttonStable && RunBookClamp(nextRPM))
-        nextRPM = -nextRPM;
+
+      if (buttonStable && RunBookClamp(nextRPM)) {
+    	  nextRPM = -nextRPM;
+      }
+
+      if (buttonStable) {
+    	  if (pulse1 < 2000) {
+    		  pulse1 = pulse1 + 100;
+    	  } else {
+    		  pulse1 = 1000;
+    	  }
+
+    	  if (pulse3 > 1000) {
+    		  pulse3 = pulse3 - 100;
+    	  } else {
+    		  pulse1 = 2000;
+    	  }
+    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse1);
+    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse1);
+    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse3);
+    	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse1);
+      }
     }
 
     UpdateBookClampStatus();
