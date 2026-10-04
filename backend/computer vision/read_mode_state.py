@@ -17,7 +17,7 @@ BLINK_MIN_SECONDS = 0.02
 BLINK_MAX_SECONDS = 0.70
 # The first blink starts one fixed window. The next two must arrive before it
 # expires; later blinks never extend the deadline.
-BLINK_WINDOW_SECONDS = 3.5
+BLINK_WINDOW_SECONDS = 2.0
 REQUIRED_FLIP_BLINKS = 3
 # One recovered open-eye frame is enough to confirm a short blink. The
 # three-blink requirement is the guard against an isolated bad frame.

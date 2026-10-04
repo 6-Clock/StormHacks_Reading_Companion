@@ -57,6 +57,12 @@ If the first vision transcript reports confidence below 92%, the app makes one a
 
 Close the standalone `book_ocr.py` preview, Windows Camera, Teams, Zoom, and any other program using that camera before scanning from the web app.
 
+## Immersive narration
+
+Turn on **Immersive narration**, then tap a paragraph or choose **Read page**. LOOB classifies each paragraph as neutral, warm, or suspenseful, selects a matching ElevenLabs voice preset, and plays a generated ambient sound for warm or suspenseful passages. Literal story events can also trigger short sounds: a creaking door, footsteps, thunder, or a knock. These cues begin with the matching sentence and are limited to two per paragraph. The **Immersive sounds** slider controls ambience and effects together. **Stop reading** stops voice and all immersive sounds; turning immersive mode off returns to plain narration. Story questions and answers keep the regular voice.
+
+Set `ELEVENLAB_VOICE_ID_WARM` and `ELEVENLAB_VOICE_ID_SUSPENSE` in `backend/.env` to hear distinct voices. If either is absent, that mood uses `ELEVENLAB_VOICE_ID` with different delivery settings. Mood and event planning uses the configured OpenAI model, with local literal-event rules as a fallback. Ambient and event sounds are synthesized in the browser, so they do not need another API key or audio files. Paragraphs with event cues are narrated in shorter sentence clips; the next clip is requested while the current one plays, and completed narration is cached until another page is scanned.
+
 ## Run the book OCR camera test
 
 Install the Python dependencies once, then start the OCR program from the repository root:
@@ -113,7 +119,17 @@ python "eyetracking_opencv.py" --camera 1
 
 Use `--camera 0` to try the laptop camera, or add `--port COM3` when the page-flipper hardware is connected.
 
-The eye tracker starts in `STOP` mode. Hold a steady camera gaze for three seconds to enter `READ` mode; look away briefly before another three-second hold can toggle the mode again. In `READ` mode, look down in the configured direction and blink twice to emit the page-flip command. Holding the eyes closed for ten seconds returns the controller to `STOP` as a safety measure.
+The eye tracker starts in `STOP` mode. It continuously drains the webcam and analyzes only the latest frame, reducing stale-frame latency. Hold a steady camera gaze for three seconds to enter `READ` mode; look away briefly before another three-second hold can toggle the mode again. Press `C` while facing the camera and keeping your eyes open for one second; it records separate median open-eye baselines for both eyes. The preview shows capture FPS, MediaPipe FPS, frame age, raw eyelid openness, normalized eyelid ratios, and the `OPEN`/`CLOSING`/`CLOSED`/`REOPENING` detector state.
+
+In `READ` mode, the **first deliberate blink starts one fixed 2-second window**. Make two additional blinks before that window expires to emit `flip right`; the later blinks do not extend the deadline. Every confirmed blink is printed in the terminal and briefly highlighted in the camera preview; the terminal prints `BLINK 3/3` before the resulting `flip right` command. Blink counts are ignored outside `READ` mode and for the brief post-flip confirmation state, so every displayed `3/3` results in a flip. The detector recognizes both full closure and a rapid relative eyelid drop, which helps with partial blinks on lower-resolution cameras. Holding the eyes closed for ten seconds returns the controller to `STOP` as a safety measure.
+
+The default requests a 640x480, 30-FPS stream for responsive processing. If partial blinks still show as `OPEN`, try higher sensitivity and optionally save diagnostics:
+
+```powershell
+python "eyetracking_opencv.py" --camera 1 --blink-sensitivity high --diagnostics-csv .\blink-diagnostics.csv
+```
+
+`low`, `normal` (default), and `high` control how small an eyelid drop may count as a closure. The CSV is local only and contains timing and landmark measurements, not video frames.
 
 ## Backend checks
 

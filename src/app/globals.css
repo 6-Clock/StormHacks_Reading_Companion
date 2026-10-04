@@ -38,10 +38,20 @@ h2 { margin-bottom: 0; font-size: 17px; }
 .ai-scan-note { margin-right: auto; color: var(--plum); }
 .scan-button { border: 0; border-radius: 9px; background: var(--orange); color: white; padding: 8px 11px; font-size: 12px; font-weight: 900; }
 .scan-button:disabled { cursor: wait; opacity: .68; }
+.narration-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: #fffaf1; font-size: 13px; font-weight: 800; }
+.read-page-button { border: 0; border-radius: 9px; background: var(--plum); color: white; padding: 8px 12px; font-size: 12px; font-weight: 900; }
+.read-page-button:disabled { opacity: .55; cursor: not-allowed; }
+.immersive-switch, .volume-control { display: inline-flex; align-items: center; gap: 7px; color: var(--ink); }
+.immersive-switch input { accent-color: var(--plum); width: 16px; height: 16px; }
+.volume-control input { width: 100px; accent-color: var(--plum); }
+.volume-control input:disabled { opacity: .45; }
 .reader { padding: 42px clamp(24px, 6vw, 70px); font-family: Georgia, "Times New Roman", serif; font-size: clamp(20px, 2.1vw, 27px); line-height: 1.75; }
 .reader p { margin-bottom: 1.2em; }
+.mood-label { display: block; color: var(--plum); font: 800 11px Arial, Helvetica, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
 .sentence { padding: 2px 4px; border-radius: 7px; text-align: left; border: 0; background: transparent; color: inherit; font: inherit; line-height: inherit; }
 .sentence:hover { background: #fff0cc; }
+.sentence.active { background: #f1e8ff; outline: 2px solid #d5c3f1; }
+.sentence:focus-visible, .read-page-button:focus-visible, .immersive-switch input:focus-visible, .volume-control input:focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
 .reader-help { padding: 15px 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; font-weight: 700; }
 .chat { display: flex; flex-direction: column; }
 .messages { flex: 1; display: flex; flex-direction: column; gap: 13px; padding: 20px; overflow-y: auto; max-height: 505px; }

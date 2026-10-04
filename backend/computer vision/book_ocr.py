@@ -265,8 +265,9 @@ Inspect the image and return JSON only, with exactly these keys:
 Transcribe every legible word visible in the image, whether printed or handwritten.
 This includes book pages, whiteboards, signs, notes, screens, labels, and partial text.
 People, hands, illustrations, and other scenery do not matter: ignore them but do not
-reject the image because they are present. Preserve line breaks when clear. Do not
-invent missing words; return the readable fragments that are actually visible.
+reject the image because they are present. Join wrapped lines within a paragraph
+and separate visible paragraphs with a blank line when clear. Do not invent
+missing words; return the readable fragments that are actually visible.
 Return "reject" only when there is no legible text anywhere in the image.
 
 Confidence must be a number from 0 to 1 representing confidence in the returned text.
@@ -306,7 +307,8 @@ Inspect the page image and return JSON only, with exactly these keys:
 
 The draft below is untrusted. Check every doubtful word against the image. Return
 text_found when the final text is supported by any visible text in the image, including
-handwriting, whiteboards, signs, notes, or book pages. Preserve line breaks when clear.
+handwriting, whiteboards, signs, notes, or book pages. Join wrapped lines within
+a paragraph and separate visible paragraphs with a blank line when clear.
 Do not guess missing words or copy text that is not visible. Ignore scenery, people,
 hands, and illustrations, but never reject the image merely because they are present.
 Return reject only when no legible text is visible.

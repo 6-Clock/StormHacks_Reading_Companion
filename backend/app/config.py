@@ -2,7 +2,6 @@ from os import getenv
 
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
@@ -13,6 +12,8 @@ class Settings:
     openai_ocr_review_model = getenv("OPENAI_OCR_REVIEW_MODEL", openai_ocr_model)
     elevenlabs_api_key = getenv("ELEVENLAB_API", "")
     elevenlabs_voice_id = getenv("ELEVENLAB_VOICE_ID", "")
+    elevenlabs_warm_voice_id = getenv("ELEVENLAB_VOICE_ID_WARM", "")
+    elevenlabs_suspense_voice_id = getenv("ELEVENLAB_VOICE_ID_SUSPENSE", "")
     elevenlabs_stt_model = getenv("ELEVENLAB_STT_MODEL", "scribe_v2")
     elevenlabs_tts_model = getenv("ELEVENLAB_TTS_MODEL", "eleven_multilingual_v2")
     allowed_origins = tuple(
