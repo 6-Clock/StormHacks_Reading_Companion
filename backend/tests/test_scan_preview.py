@@ -1,4 +1,5 @@
 import base64
+import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -110,7 +111,7 @@ def test_scan_keeps_ai_text_and_captured_preview_even_for_rejected_page(monkeypa
 
     engine = preview_engine(lambda *args, **kwargs: TSV_HEADER + "5\t12\t8\t24\t16\t94\tLOCAL\n")
     engine.open_camera = lambda index: camera
-    engine.capture_best_frames = lambda camera: [source_frame]
+    engine.capture_best_frames = lambda camera, **kwargs: [source_frame]
     engine.frame_quality = lambda frame: (1, 100, 180)
     engine.detect_and_rectify_page = lambda frame: (corrected_page, True)
     engine.transcribe_page_with_openai = transcribe
@@ -132,9 +133,69 @@ def test_scan_keeps_ai_text_and_captured_preview_even_for_rejected_page(monkeypa
 
 def test_cancelled_calibration_has_no_captured_preview(monkeypatch):
     monkeypatch.setattr(book_scanner, "_engine", lambda: SimpleNamespace())
-    monkeypatch.setattr(book_scanner, "_capture_with_calibration_preview", lambda *args: None)
+    monkeypatch.setattr(
+        book_scanner, "_capture_with_calibration_preview", lambda *args, **kwargs: None,
+    )
 
-    result = book_scanner.scan_camera(0)
+    result = book_scanner.scan_camera(0, openai_api_key="test", openai_model="test")
 
     assert result["reason"] == "scan_cancelled"
     assert result["capture_preview"] is None
+
+
+def test_missing_provider_config_does_not_load_or_open_camera(monkeypatch):
+    def camera_must_not_open():
+        raise AssertionError("Camera was accessed before validating settings.")
+
+    monkeypatch.setattr(book_scanner, "_engine", camera_must_not_open)
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        book_scanner.scan_camera(2)
+
+
+def calibration_engine(*, visible=1):
+    released = []
+    closed = []
+    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    camera = SimpleNamespace(
+        isOpened=lambda: True, read=lambda: (True, frame),
+        release=lambda: released.append(True),
+    )
+    cv = SimpleNamespace(
+        error=cv2.error, FONT_HERSHEY_SIMPLEX=0, LINE_AA=0, WND_PROP_VISIBLE=0,
+        rectangle=lambda *args: None, putText=lambda *args: None,
+        imshow=lambda *args: None, waitKey=lambda *_: -1,
+        getWindowProperty=lambda *args: visible,
+        destroyWindow=lambda *_: closed.append(True),
+    )
+    engine = SimpleNamespace(cv2=cv, open_camera=lambda _: camera,
+                             capture_best_frames=lambda *args, **kwargs: [frame])
+    return engine, released, closed
+
+
+def test_closing_native_calibration_cancels_and_releases_camera():
+    engine, released, closed = calibration_engine(visible=0)
+    assert book_scanner._capture_with_calibration_preview(engine, 2) is None
+    assert released == closed == [True]
+
+
+def test_browser_capture_works_without_focusing_native_window():
+    engine, released, closed = calibration_engine()
+    capture = threading.Event()
+    capture.set()
+    stages = []
+    frames = book_scanner._capture_with_calibration_preview(
+        engine, 2, capture_event=capture,
+        progress=lambda stage, _: stages.append(stage),
+    )
+    assert len(frames) == 1
+    assert stages == ["framing", "capturing"]
+    assert released == closed == [True]
+
+
+def test_calibration_deadline_releases_camera(monkeypatch):
+    engine, released, closed = calibration_engine()
+    times = iter([0, 61])
+    monkeypatch.setattr(book_scanner.time, "monotonic", lambda: next(times))
+    with pytest.raises(TimeoutError, match="60 seconds"):
+        book_scanner._capture_with_calibration_preview(engine, 2)
+    assert released == closed == [True]

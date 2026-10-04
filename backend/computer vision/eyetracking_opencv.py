@@ -4,46 +4,40 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import math
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
-
 
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR.parent))
 sys.path.insert(0, str(PROJECT_DIR / "vendor_vision"))
 sys.path.insert(0, str(PROJECT_DIR / "venv" / "Lib" / "site-packages"))
 
-import cv2
-import mediapipe as mp
-import serial
+import cv2  # noqa: E402
+import mediapipe as mp  # noqa: E402
+import serial  # noqa: E402
+from blink_detector import (  # noqa: E402
+    BLINK_SENSITIVITY,
+    EyeReading,
+    RelativeBlinkDetector,
+)
+from read_mode_state import ReadModeController  # noqa: E402
 
-from read_mode_state import ReadModeController
-
-from app.services.eye_telemetry import EyeTelemetryPublisher  # noqa: E402
-
+from app.services.eye_publisher import EyeTelemetryPublisher  # noqa: E402
+from app.services.tracker_control import TrackerControlClient  # noqa: E402
 
 DEFAULT_CAMERA_INDEX = 1
 DEFAULT_CAPTURE_WIDTH = 640
 DEFAULT_CAPTURE_HEIGHT = 480
 DEFAULT_CAPTURE_FPS = 30
-EYE_OPEN_THRESHOLD = 0.18
-CALIBRATION_SECONDS = 1.0
 CAMERA_GAZE_X = (0.38, 0.62)
 CAMERA_GAZE_Y = (0.30, 0.70)
 FACE_CENTER_X = (0.38, 0.62)
 MIN_FACE_WIDTH_PIXELS = 55
 GAZE_SMOOTHING = 0.35
-
-# (one-eye closure ratio, two-eye average closure ratio, sharp-drop ratio)
-BLINK_SENSITIVITY = {
-    "low": (0.55, 0.62, 0.20),
-    "normal": (0.68, 0.75, 0.12),
-    "high": (0.78, 0.85, 0.08),
-}
 
 LEFT_EYE = {"outer": 33, "inner": 133, "top": 159, "bottom": 145, "iris": 468}
 RIGHT_EYE = {"outer": 263, "inner": 362, "top": 386, "bottom": 374, "iris": 473}
@@ -57,7 +51,7 @@ class LatestFrameReader:
         self._lock = threading.Lock()
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
-        self._latest: tuple[int, float, object] | None = None
+        self._latest: tuple[int, float, float, object] | None = None
         self._frame_id = 0
         self.capture_fps = 0.0
         self.read_failures = 0
@@ -72,6 +66,7 @@ class LatestFrameReader:
         while self._running.is_set():
             ok, frame = self._capture.read()
             captured_at = time.monotonic()
+            captured_epoch = time.time()
             if not ok:
                 self.read_failures += 1
                 time.sleep(0.01)
@@ -82,14 +77,14 @@ class LatestFrameReader:
                     self.capture_fps = instant_fps if self.capture_fps == 0.0 else self.capture_fps * 0.85 + instant_fps * 0.15
                 self._last_capture_at = captured_at
                 self._frame_id += 1
-                self._latest = (self._frame_id, captured_at, frame)
+                self._latest = (self._frame_id, captured_at, captured_epoch, frame)
 
-    def newest(self) -> tuple[int, float, object] | None:
+    def newest(self) -> tuple[int, float, float, object] | None:
         with self._lock:
             if self._latest is None:
                 return None
-            frame_id, captured_at, frame = self._latest
-            return frame_id, captured_at, frame.copy()
+            frame_id, captured_at, captured_epoch, frame = self._latest
+            return frame_id, captured_at, captured_epoch, frame.copy()
 
     def close(self) -> None:
         self._running.clear()
@@ -112,8 +107,11 @@ class SerialCommandSender:
     def send(self, command: str) -> None:
         payload = f"{command}\n".encode("ascii")
         if self.connection is not None:
-            self.connection.write(payload)
-            self.connection.flush()
+            # write_timeout=1 bounds the send. flush() can wait indefinitely on
+            # some drivers and would outlive the coordinator's reservation.
+            written = self.connection.write(payload)
+            if written != len(payload):
+                raise serial.SerialTimeoutException("Incomplete page-turn command write")
             print(f"[SERIAL TX] {command}")
         else:
             print(f"[SERIAL PREVIEW] {command}")
@@ -152,97 +150,6 @@ class GazeCalibration:
         return self.smoothed_x, self.smoothed_y
 
 
-@dataclass(frozen=True)
-class EyeReading:
-    eyes_open: bool
-    phase: str
-    left_ratio: float
-    right_ratio: float
-    calibration_progress: float
-    calibration_finished: bool
-    sample_count: int
-
-
-class RelativeBlinkDetector:
-    """Detect eyelid closure relative to a per-user open-eye baseline."""
-
-    def __init__(self, sensitivity: str) -> None:
-        self.single_close_ratio, self.pair_close_ratio, self.sharp_drop_ratio = BLINK_SENSITIVITY[sensitivity]
-        self.reset()
-
-    def reset(self) -> None:
-        self.left_baseline: float | None = None
-        self.right_baseline: float | None = None
-        self._calibration_started_at: float | None = None
-        self._samples: list[tuple[float, float]] = []
-        self._previous_average_ratio: float | None = None
-        self._was_closed = False
-        self.phase = "NO CALIBRATION"
-
-    def begin_calibration(self, now: float) -> None:
-        self._calibration_started_at = now
-        self._samples = []
-        self._previous_average_ratio = None
-        self._was_closed = False
-        self.phase = "CALIBRATING"
-
-    def observe(self, now: float, left: float, right: float, *, eyes_visible: bool) -> EyeReading:
-        calibration_finished = False
-        if not eyes_visible:
-            self._previous_average_ratio = None
-            self._was_closed = False
-            self.phase = "NO FACE"
-            return EyeReading(False, self.phase, 0.0, 0.0, self._calibration_progress(now), False, len(self._samples))
-
-        if self._calibration_started_at is not None and left >= 0.06 and right >= 0.06:
-            self._samples.append((left, right))
-        if self._calibration_started_at is not None and now - self._calibration_started_at >= CALIBRATION_SECONDS:
-            if self._samples:
-                left_values, right_values = zip(*self._samples)
-                self.left_baseline = float(sorted(left_values)[len(left_values) // 2])
-                self.right_baseline = float(sorted(right_values)[len(right_values) // 2])
-                calibration_finished = True
-                # Ratios before calibration used the fallback scale. Do not
-                # compare that scale to the first calibrated frame.
-                self._previous_average_ratio = None
-            self._calibration_started_at = None
-
-        left_ratio = left / max(self.left_baseline or EYE_OPEN_THRESHOLD, 1e-6)
-        right_ratio = right / max(self.right_baseline or EYE_OPEN_THRESHOLD, 1e-6)
-        average_ratio = (left_ratio + right_ratio) / 2.0
-        sharp_drop = (
-            self._previous_average_ratio is not None
-            and self._previous_average_ratio - average_ratio >= self.sharp_drop_ratio
-        )
-        closure = (
-            min(left_ratio, right_ratio) <= self.single_close_ratio
-            or average_ratio <= self.pair_close_ratio
-            or sharp_drop
-        )
-        if closure:
-            self.phase = "CLOSED" if self._was_closed else "CLOSING"
-        elif self._was_closed:
-            self.phase = "REOPENING"
-        elif self._calibration_started_at is not None:
-            self.phase = "CALIBRATING"
-        else:
-            self.phase = "OPEN"
-        self._was_closed = closure
-        self._previous_average_ratio = average_ratio
-        return EyeReading(
-            eyes_open=not closure,
-            phase=self.phase,
-            left_ratio=left_ratio,
-            right_ratio=right_ratio,
-            calibration_progress=self._calibration_progress(now),
-            calibration_finished=calibration_finished,
-            sample_count=len(self._samples),
-        )
-
-    def _calibration_progress(self, now: float) -> float:
-        if self._calibration_started_at is None:
-            return 0.0
-        return min(1.0, (now - self._calibration_started_at) / CALIBRATION_SECONDS)
 
 
 def distance(a, b) -> float:
@@ -278,6 +185,25 @@ def text(frame, row: int, value: str, color=(255, 255, 255)) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
+    parser.add_argument(
+        "--ocr-camera",
+        type=int,
+        help="Separate book camera to scan automatically after a confirmed three-blink flip.",
+    )
+    parser.add_argument(
+        "--auto-scan-api",
+        default="http://127.0.0.1:8001/v1/auto-scans",
+        help=(
+            "Local FastAPI URL for settings and page-turn coordination; "
+            "accepts the old OCR endpoint."
+        ),
+    )
+    parser.add_argument(
+        "--ocr-settle-seconds",
+        type=float,
+        default=8.0,
+        help="Seconds to wait after a flip before capturing the page (8–30; default: 8).",
+    )
     parser.add_argument("--port", help="Hardware serial port, for example COM3. Omit for preview mode.")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--width", type=int, default=DEFAULT_CAPTURE_WIDTH, help="Requested camera width (default: 640).")
@@ -293,6 +219,15 @@ def main() -> int:
         help="Minimum detected face width for reliable gaze gestures (default: 55).",
     )
     args = parser.parse_args()
+    diagnostics_logger = logging.getLogger("app.services.eye_publisher")
+    diagnostics_logger.setLevel(logging.INFO)
+    if not diagnostics_logger.handlers:
+        diagnostics_logger.addHandler(logging.StreamHandler())
+    diagnostics_logger.propagate = False
+    if args.ocr_camera is not None and args.ocr_camera == args.camera:
+        parser.error("--ocr-camera must be different from --camera so each camera has one job.")
+    if not 8 <= args.ocr_settle_seconds <= 30:
+        parser.error("--ocr-settle-seconds must be between 8 and 30.")
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -325,9 +260,17 @@ def main() -> int:
 
     pending_commands: list[str] = []
     controller = ReadModeController(pending_commands.append)
+    controls = TrackerControlClient(
+        args.auto_scan_api,
+        eye_camera_index=args.camera,
+        camera_index=args.ocr_camera,
+        settle_seconds=args.ocr_settle_seconds,
+        send_command=command_sender.send,
+    )
     gaze_calibration = GazeCalibration()
     blink_detector = RelativeBlinkDetector(args.blink_sensitivity)
     blink_flash_until = 0.0
+    last_blink_count = 0
     previous_frame_id = 0
     inference_fps = 0.0
     face_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -337,9 +280,14 @@ def main() -> int:
         min_detection_confidence=0.50,
         min_tracking_confidence=0.50,
     )
-    telemetry = EyeTelemetryPublisher()
-    telemetry.event("tracker", f"Eye tracker started on camera {args.camera}")
+    telemetry = EyeTelemetryPublisher(controls.base_url, controls.session_id)
+    tracker_message = f"Eye tracker started on camera {args.camera}"
+    if args.ocr_camera is not None:
+        tracker_message += f"; automatic OCR will use camera {args.ocr_camera}"
+    telemetry.event("tracker", tracker_message)
     previous_mode = None
+    previous_control_revision = None
+    controls.start()
 
     try:
         while True:
@@ -349,7 +297,7 @@ def main() -> int:
                 if key in (ord("q"), 27):
                     break
                 continue
-            frame_id, captured_at, frame = newest
+            frame_id, captured_at, captured_epoch, frame = newest
             previous_frame_id = frame_id
             now = captured_at
             frame = cv2.flip(frame, 1)
@@ -398,14 +346,30 @@ def main() -> int:
                     "calibration",
                     f"Eye baseline calibrated from {eye_reading.sample_count} samples",
                 )
+            control_state = controls.snapshot()
+            if (
+                controller.blink_only != control_state.blink_only
+                or previous_control_revision != control_state.revision
+            ):
+                controller.set_blink_only(control_state.blink_only, force=True)
+                previous_control_revision = control_state.revision
+                telemetry.event(
+                    "mode",
+                    "Blink-only test mode enabled" if control_state.blink_only
+                    else "Gaze hold required; fresh reading gesture required",
+                )
+            controls.applied(control_state.revision, controller.blink_only)
             snapshot = controller.update(
                 now,
                 eyes_visible=eyes_visible,
                 eyes_open=eyes_visible and eye_reading.eyes_open,
                 looking_at_camera=camera_gaze,
+                turns_blocked=control_state.turns_blocked,
+                calibrated=blink_detector.calibrated,
             )
             if snapshot.blink_recorded:
-                blink_flash_until = now + 0.35
+                last_blink_count = snapshot.blink_count
+                blink_flash_until = now + (1.5 if last_blink_count == 3 else 0.35)
                 print(f"[BLINK] {snapshot.blink_count}/3 ({snapshot.last_blink_duration:.2f}s)")
                 telemetry.event(
                     "blink",
@@ -414,9 +378,12 @@ def main() -> int:
                 )
             while pending_commands:
                 command = pending_commands.pop(0)
-                command_sender.send(command)
-                destination = "Serial sent" if args.port else "Serial preview"
-                telemetry.event("command", f"{destination}: {command}")
+                if command == "flip right" and not controls.dispatch_flip():
+                    telemetry.event(
+                        "command", "Page turn skipped while scanner or tracker controls busy",
+                    )
+            for event_type, message in controls.drain_events():
+                telemetry.event(event_type, message)
             if snapshot.display_mode != previous_mode:
                 telemetry.event("mode", f"Mode changed to {snapshot.display_mode}")
                 previous_mode = snapshot.display_mode
@@ -429,11 +396,14 @@ def main() -> int:
                 "openness": {"left": eye_reading.left_ratio, "right": eye_reading.right_ratio},
                 "phase": eye_reading.phase,
                 "blink_count": snapshot.blink_count,
+                "calibrated": blink_detector.calibrated,
+                "turns_blocked": control_state.turns_blocked,
+                "blink_only": controller.blink_only,
                 "look_progress": snapshot.look_progress,
                 "capture_fps": reader.capture_fps,
                 "inference_fps": inference_fps,
                 "frame_age_ms": frame_age_ms,
-            })
+            }, captured_at=captured_epoch, force=snapshot.blink_recorded)
             if diagnostic_writer is not None:
                 diagnostic_writer.writerow((f"{captured_at:.6f}", f"{frame_age_ms:.1f}", f"{reader.capture_fps:.1f}", f"{inference_fps:.1f}", f"{left_openness:.4f}", f"{right_openness:.4f}", f"{eye_reading.left_ratio:.3f}", f"{eye_reading.right_ratio:.3f}", eye_reading.phase, f"{face_width_px:.1f}", eyes_visible, snapshot.display_mode))
 
@@ -441,14 +411,22 @@ def main() -> int:
             text(frame, 0, f"MODE: {snapshot.display_mode}", mode_color)
             text(frame, 1, f"Camera {args.camera}: {frame.shape[1]}x{frame.shape[0]}  capture={reader.capture_fps:.1f} FPS  age={frame_age_ms:.0f}ms")
             text(frame, 2, f"MediaPipe={inference_fps:.1f} FPS  sensitivity={args.blink_sensitivity}  face={face_width_px:.0f}px")
-            text(frame, 3, f"Camera gaze: {camera_gaze}  hold={snapshot.look_progress:.1f}/3.0s")
+            text(frame, 3, "Blink-only test: no gaze hold required" if controller.blink_only
+                 else f"Camera gaze: {camera_gaze}  hold={snapshot.look_progress:.1f}/3.0s")
             blink_color = (0, 255, 0) if now < blink_flash_until else (255, 255, 255)
-            text(frame, 4, f"Blink recorded: {snapshot.blink_count}/3  action=flip right", blink_color)
+            displayed_blinks = last_blink_count if now < blink_flash_until else snapshot.blink_count
+            text(frame, 4, f"Blink recorded: {displayed_blinks}/3  action=flip right", blink_color)
             phase_color = (0, 255, 0) if eye_reading.phase in {"CLOSING", "CLOSED", "REOPENING"} else (255, 255, 255)
             text(frame, 5, f"Eyelids: {eye_reading.phase}  raw L/R={left_openness:.3f}/{right_openness:.3f}", phase_color)
             text(frame, 6, f"Relative L/R={eye_reading.left_ratio:.2f}/{eye_reading.right_ratio:.2f}  close thresholds={blink_detector.single_close_ratio:.2f}/{blink_detector.pair_close_ratio:.2f}")
             if eye_reading.calibration_progress:
                 text(frame, 7, f"Calibrating open eyes: {eye_reading.calibration_progress * 100:.0f}%", (0, 220, 255))
+            elif not blink_detector.calibrated:
+                text(frame, 7, "Press C to calibrate before testing blinks", (0, 190, 255))
+            elif control_state.turns_blocked:
+                text(frame, 7, "Page turns paused: scanner busy or waiting for API", (0, 190, 255))
+            elif controller.blink_only:
+                text(frame, 7, "Blink-only test: 3 blinks ready", (0, 220, 0))
             elif snapshot.toggle_armed:
                 text(frame, 7, "3-second toggle: ARMED", (0, 220, 0))
             else:
@@ -474,6 +452,7 @@ def main() -> int:
                 )
     finally:
         telemetry.close()
+        controls.close()
         face_mesh.close()
         reader.close()
         cv2.destroyAllWindows()

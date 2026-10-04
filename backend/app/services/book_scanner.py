@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
@@ -15,7 +17,19 @@ from app.services.scan_preview import capture_preview
 ENGINE_PATH = Path(__file__).resolve().parents[2] / "computer vision" / "book_ocr.py"
 
 
-def _capture_with_calibration_preview(engine: ModuleType, camera_index: int) -> list[Any] | None:
+class ScanCancelled(Exception):
+    """Cancellation requested; unwind camera/window resources cooperatively."""
+
+
+def _check_cancel(cancel_event: Any) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ScanCancelled()
+
+
+def _capture_with_calibration_preview(
+    engine: ModuleType, camera_index: int, *, cancel_event: Any = None,
+    capture_event: Any = None, progress: Callable[[str, str], None] | None = None,
+) -> list[Any] | None:
     """Let the reader frame the page before collecting the sharp OCR samples."""
     camera = engine.open_camera(camera_index)
     if not camera.isOpened():
@@ -26,8 +40,16 @@ def _capture_with_calibration_preview(engine: ModuleType, camera_index: int) -> 
         )
 
     window_name = "LOOB OCR calibration — C: capture | Q: cancel"
+    framing_started = time.monotonic()
     try:
+        if progress:
+            progress(
+                "framing", "Frame the page; click Capture now or press C in the camera window.",
+            )
         while True:
+            _check_cancel(cancel_event)
+            if time.monotonic() - framing_started > 60:
+                raise TimeoutError("Page framing timed out after 60 seconds.")
             ok, frame = camera.read()
             if not ok:
                 raise RuntimeError("The camera stopped sending frames. Reconnect it and try again.")
@@ -49,10 +71,17 @@ def _capture_with_calibration_preview(engine: ModuleType, camera_index: int) -> 
             )
             engine.cv2.imshow(window_name, preview)
             key = engine.cv2.waitKey(1) & 0xFF
-            if key == ord("c"):
-                return engine.capture_best_frames(camera)
+            if engine.cv2.getWindowProperty(window_name, engine.cv2.WND_PROP_VISIBLE) < 1:
+                return None
             if key in (ord("q"), 27):
                 return None
+            if key == ord("c") or (capture_event is not None and capture_event.is_set()):
+                _check_cancel(cancel_event)
+                if progress:
+                    progress("capturing", "Capturing sharp page frames.")
+                return engine.capture_best_frames(
+                    camera, check_cancel=lambda: _check_cancel(cancel_event),
+                )
     except engine.cv2.error as error:
         raise RuntimeError(
             "Could not open the OCR calibration window. "
@@ -85,11 +114,24 @@ def scan_camera(
     openai_model: str = "",
     openai_revision_model: str = "",
     show_preview: bool = True,
+    cancel_event: Any = None,
+    capture_event: Any = None,
+    progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     """Capture a page and transcribe it with image-grounded AI OCR only."""
+    if not openai_api_key or not openai_model:
+        raise RuntimeError(
+            "AI OCR needs OPENAI_API_KEY and OPENAI_OCR_MODEL or OPENAI_MODEL in backend/.env."
+        )
+    _check_cancel(cancel_event)
     engine = _engine()
+    if progress:
+        progress("opening_camera", f"Opening camera {camera_index}.")
     if show_preview:
-        frames = _capture_with_calibration_preview(engine, camera_index)
+        frames = _capture_with_calibration_preview(
+            engine, camera_index, cancel_event=cancel_event,
+            capture_event=capture_event, progress=progress,
+        )
         if frames is None:
             return {
                 "accepted": False,
@@ -111,7 +153,12 @@ def scan_camera(
                 "Close other camera apps and try another index."
             )
         try:
-            frames = engine.capture_best_frames(camera)
+            _check_cancel(cancel_event)
+            if progress:
+                progress("capturing", "Capturing sharp page frames.")
+            frames = engine.capture_best_frames(
+                camera, check_cancel=lambda: _check_cancel(cancel_event),
+            )
         finally:
             camera.release()
 
@@ -128,14 +175,17 @@ def scan_camera(
             "capture_preview": None,
         }
 
-    if not openai_api_key or not openai_model:
-        raise RuntimeError(
-            "AI OCR needs OPENAI_API_KEY and OPENAI_OCR_MODEL or OPENAI_MODEL in backend/.env."
-        )
-
+    _check_cancel(cancel_event)
     _, sharpness, brightness = engine.frame_quality(frames[0])
     page, page_detected = engine.detect_and_rectify_page(frames[0])
+    if progress:
+        progress("transcribing", "Transcribing the captured page.")
     review = engine.transcribe_page_with_openai(page, openai_api_key, openai_model)
+    _check_cancel(cancel_event)
+    if review.reason == "openai_request_timed_out":
+        raise TimeoutError("OCR transcription timed out. Please try again.")
+    if review.reason == "openai_request_failed":
+        raise RuntimeError("OCR provider request failed. Check the API settings and connection.")
     print(
         "AI OCR transcription "
         f"model={openai_model} accepted={review.accepted} "
@@ -149,12 +199,17 @@ def scan_camera(
     reason = "openai_vision_accepted" if review.accepted else review.reason
     if review.accepted and engine.should_request_openai_revision(review):
         revision_status = "requested"
+        if progress:
+            progress("reviewing", "Checking uncertain text against the captured page.")
         revision = engine.revise_page_with_openai(
             page,
             review.text,
             openai_api_key,
             openai_revision_model or openai_model,
         )
+        _check_cancel(cancel_event)
+        if revision.reason == "openai_revision_timed_out":
+            raise TimeoutError("OCR text review timed out. Please try again.")
         print(
             "AI OCR revision "
             f"model={openai_revision_model or openai_model} accepted={revision.accepted} "
@@ -171,6 +226,10 @@ def scan_camera(
     elif review.accepted:
         revision_status = "skipped_high_confidence"
 
+    if progress:
+        progress("preview", "Preparing the scan photo and word boxes.")
+    preview = capture_preview(engine, page)
+    _check_cancel(cancel_event)
     return {
         "accepted": accepted,
         "reason": reason,
@@ -185,5 +244,5 @@ def scan_camera(
         "openai_review_status": review_status,
         "openai_revision": asdict(revision) if revision else None,
         "openai_revision_status": revision_status,
-        "capture_preview": capture_preview(engine, page),
+        "capture_preview": preview,
     }

@@ -8,7 +8,7 @@ Prerequisites:
 
 - Node.js 20 or later
 - Python 3.11 or later
-- A USB camera for the computer-vision programs
+- Two separate cameras for simultaneous eye tracking and book OCR (current setup: eye camera `1`, book camera `2`); one camera is enough to run either standalone prototype
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) is optional for word-box overlays on captured pages and the legacy `--local-ocr` troubleshooting fallback
 
 ## Install all project dependencies
@@ -51,19 +51,41 @@ The **Reader** view opens a notebook with an actual question-and-answer journal 
 
 Click the green bookmark to switch to the **Developer** view. Question, microphone, and narration controls share their state with Reader; answer replay, immersive sound settings, and scanning controls remain in Developer. The appendix also shows the eye diagram, relative eye openness, gaze direction, blink phase/count, frame timing, OCR results, and real session events. Click the bookmark again to return to the Reader. It also works with Enter or Space when focused. Switching views preserves the page, question draft, sound preferences, and playback. On phones the notebook pages stack vertically.
 
-To see live eyes, run the tracker in another terminal (with the backend environment activated):
+To use two cameras, run the tracker in another terminal (with the backend environment activated) while FastAPI is already running:
 
 ```powershell
-python ".\backend\computer vision\eyetracking_opencv.py" --camera 0
+python ".\backend\computer vision\eyetracking_opencv.py" --camera 1 --ocr-camera 2
 ```
 
-Press **C** in the tracker window to calibrate. The developer view automatically picks up its measurements. Use a separate camera for book scanning when the tracker is active. If no tracker is running, the eye panel shows **Tracker offline**. The diagram estimates iris direction; it does not yet identify a word or location on the book. OCR displays the captured page photo and, when local Tesseract is available, actual word boxes positioned using normalized image coordinates. Live measurements poll every 500 ms, retry every five seconds while offline, and pause while the browser tab is hidden.
+Camera `1` tracks eyes and camera `2` faces the book in this example. If your eye camera is `2` and book camera is `1`, use `--camera 2 --ocr-camera 1` and select **Cam 1** for manual OCR. Press **C** in the tracker window while keeping your eyes open to calibrate. Developer automatically picks up its measurements and explains whether real blink detection is ready or paused. The diagram estimates iris direction; it does not yet identify a word or location on the book. OCR displays the captured page photo and available actual word boxes. Live measurements poll every 500 ms, retry every two seconds when the tracker is unavailable, and pause while the browser tab is hidden.
+
+Diagnostics travel through a background HTTP sender to FastAPI memory. They no longer depend on replacing `eyes.json` on Windows. Upload failures never block the camera loop; only the latest pending measurements are retained, and data older than two seconds is shown as offline. Restart the tracker after updating its code. To verify real blinks, calibrate, enter READ mode or enable **Blink-only test mode**, then blink three times within two seconds. Developer's **Camera recorded 3 / 3** confirmation comes from the real detector's event log; **Test 3 blinks** is a separate simulation.
 
 ## Scan a physical page into the reading screen
 
-With the FastAPI service and Next.js app running, use **Scan** in the Developer view. Choose the USB camera index there (normally `1`). A local **LOOB OCR calibration** window opens; center the book page inside the yellow guide, then press **C** in that camera window to capture it; press **Q** or Escape to cancel. A successful scan replaces the displayed passage; narration and LOOB questions then use the scanned text. The Developer view retains the latest scan photo, result, duration, and available OCR metrics. Web scans are initiated manually; an eye-triggered page flip does not automatically scan the next page.
+With the FastAPI service and Next.js app running, use **Scan OCR** in the Developer view. Choose the USB camera index there (normally `2` when camera `1` is the eye tracker). A local **LOOB OCR calibration** window opens; center the book page inside the yellow guide, then choose **Capture now** in Developer or press **C** in that camera window. Choose **Cancel scan**, press **Q**/Escape, or close the camera window to cancel. Framing times out after 60 seconds. A successful scan replaces the displayed passage; narration and LOOB questions then use the scanned text. Developer retains the scan photo, result, duration, and available OCR metrics.
 
-After you press **C** in the calibration window, the web scanner sends the selected, perspective-corrected image to OpenAI for transcription. AI vision remains the authoritative source of reading text, including handwritten notes and whiteboards; people and other scenery are ignored rather than causing a rejection. OpenCV captures the sharpest frame and corrects page perspective. Optional local Tesseract detects word boxes for the photo overlay; its text does not replace the AI transcript, and unavailable boxes are not simulated.
+### Page-turn delay and scan controls
+
+For hands-free capture, start the tracker with `--camera 1 --ocr-camera 2`. Three confirmed blinks within the two-second window reserve the shared camera/page-turn gate before sending `flip right`. The tracker then confirms that the command was sent, starting an **eight-second wait** before the OCR camera opens. Time spent reserving the turn does not count toward this delay. Developer shows **OCR starts in 8s** and counts down while the page turns, then reports capture and transcription progress.
+
+| Trigger | Wait before OCR | Capture behavior |
+| --- | --- | --- |
+| **Scan OCR** | No page-turn delay | Opens manual framing; choose **Capture now** or press **C** |
+| Real three-blink page turn | At least 8 seconds after the command is sent | Captures automatically without a calibration window |
+| **Test 3 blinks** | 8 seconds after the simulated blink sequence | Captures automatically; sends no hardware command |
+
+Use `--ocr-settle-seconds 10` for a longer wait; the supported range is 8–30 seconds. The server enforces the eight-second minimum for page turns and blink tests even if an older tracker requests a shorter delay. Connect the page flipper with `--port COM3` (or its actual port); without a port, serial commands are previewed in the terminal. The two camera indexes must be different.
+
+To test real blinks without the gaze requirement, enable **Blink-only test mode** in Developer. It shows whether the tracker has applied the setting; calibrate the eyes with **C** first. Three blinks can then turn a page outside READ mode, and become available again after scanning finishes. Switching the setting clears partial gestures. Turning it off restores the three-second gaze requirement. The setting defaults off after restarting the API. **Test 3 blinks** is a separate simulated test, described above.
+
+**Only one scan or page turn can be active.** During the countdown, capture, transcription, or cancellation, new scan requests are skipped (HTTP `409`), with no queue or automatic retry. The scan and blink-test buttons are disabled while busy. A request that arrives before the UI learns about another scan shows a skipped notice. Finishing OCR never replays skipped requests: a fresh click or three-blink gesture is needed after the current job releases the camera. An unavailable API also blocks physical page turns.
+
+Scan requests return immediately and show progress separately. **Cancel scan** stays available during an active job. It stops the worker before releasing camera ownership; cancellation during a page turn also waits for the settling guard. Camera and OCR deadlines prevent indefinite waits, and disconnected status automatically recovers when the API returns. Run one FastAPI process for this local hardware coordinator; do not use multiple Uvicorn workers.
+
+After updating backend code, restart FastAPI unless it is running with `--reload`. Restart the native eye tracker to load tracker changes. The eight-second minimum is enforced by the updated API even before the tracker is restarted.
+
+After manual capture or the automatic page-turn wait, the web scanner sends the selected, perspective-corrected image to OpenAI for transcription. AI vision remains the authoritative source of reading text, including handwritten notes and whiteboards; people and other scenery are ignored rather than causing a rejection. OpenCV captures the sharpest frame and corrects page perspective. Optional local Tesseract detects word boxes for the photo overlay; its text does not replace the AI transcript, and unavailable boxes are not simulated.
 
 If a scan is rejected, the Uvicorn terminal logs the configured model plus the AI reason and confidence. This distinguishes a page-quality rejection from an API/model configuration error.
 
@@ -91,6 +113,8 @@ Use `--camera 0` for the laptop camera or `--camera 1` for the first external ca
 - Press `c` to scan the current page.
 - Press `f` to trigger the placeholder page-flip action, wait for the page to settle, then scan.
 - Press `q` to quit.
+
+This standalone diagnostic has its own 1.5-second placeholder wait. The eight-second countdown described above belongs to the app's coordinated eye-tracker and OCR workflow.
 
 Before launching, close Teams, Zoom, Discord, the Windows Camera app, and browser tabs that may be using the webcam. In **Settings → Privacy & security → Camera**, allow camera access for desktop apps. If Windows asks for access when the preview opens, allow it.
 
@@ -121,7 +145,7 @@ The vision pass receives only the selected, corrected image and returns any legi
 After the unified dependency install, run the eye-tracking prototype with:
 
 ```powershell
-python ".\backend\computer vision\eyetracking_opencv.py" --camera 1
+python ".\backend\computer vision\eyetracking_opencv.py" --camera 1 --ocr-camera 2
 ```
 
 The eye tracker requires MediaPipe `0.10.14` because it uses the legacy Face Mesh iris-landmark API. The unified requirements file installs that version. If a newer MediaPipe version was already installed, force the compatible version from `backend/computer vision`:
@@ -131,11 +155,11 @@ python -m pip install --force-reinstall "mediapipe==0.10.14"
 python "eyetracking_opencv.py" --camera 1
 ```
 
-Use `--camera 0` to try the laptop camera, or add `--port COM3` when the page-flipper hardware is connected.
+Use `--camera 0` to try the laptop camera, pass a different `--ocr-camera` to enable automatic OCR, or add `--port COM3` when the page-flipper hardware is connected. Omit `--ocr-camera` to run eye tracking without automatic OCR. FastAPI still coordinates physical turns and settings, so keep it running even when OCR is disabled.
 
 The eye tracker starts in `STOP` mode. It continuously drains the webcam and analyzes only the latest frame, reducing stale-frame latency. Hold a steady camera gaze for three seconds to enter `READ` mode; look away briefly before another three-second hold can toggle the mode again. Press `C` while facing the camera and keeping your eyes open for one second; it records separate median open-eye baselines for both eyes. The preview shows capture FPS, MediaPipe FPS, frame age, raw eyelid openness, normalized eyelid ratios, and the `OPEN`/`CLOSING`/`CLOSED`/`REOPENING` detector state.
 
-In `READ` mode, the **first deliberate blink starts one fixed 2-second window**. Make two additional blinks before that window expires to emit `flip right`; the later blinks do not extend the deadline. Every confirmed blink is printed in the terminal and briefly highlighted in the camera preview; the terminal prints `BLINK 3/3` before the resulting `flip right` command. Blink counts are ignored outside `READ` mode and for the brief post-flip confirmation state, so every displayed `3/3` results in a flip. The detector recognizes both full closure and a rapid relative eyelid drop, which helps with partial blinks on lower-resolution cameras. Holding the eyes closed for ten seconds returns the controller to `STOP` as a safety measure.
+After calibration, the **first deliberate blink starts one fixed 2-second window** in READ mode (or outside READ with Blink-only test mode enabled). Two more blinks request a page turn; later blinks do not extend the deadline. The terminal prints the blink count, reservation outcome, serial output, and scan status. After the brief page signal, LOOB enters `STOP`. In normal mode, look away and then hold your gaze for three seconds to resume. In blink-only mode, fresh blinks become available after the scan/settling guard clears. The detector recognizes full closure and a rapid relative eyelid drop. Holding the eyes closed for ten seconds clears the gesture and returns the controller to `STOP`.
 
 The default requests a 640x480, 30-FPS stream for responsive processing. If partial blinks still show as `OPEN`, try higher sensitivity and optionally save diagnostics:
 
@@ -154,5 +178,7 @@ Set-Location backend
 python -m pytest
 python -m ruff check .
 ```
+
+The scan coordinator tests cover the full eight-second delay after the page-turn command, skipped busy requests, and fresh starts after completion. Tracker tests cover discarded gestures while busy. `tests/browser/scan-controls.js` checks the countdown, disabled controls, cancellation, and skipped-request recovery using mocked API responses; run it with gstack `browse eval` on localhost, then reload to restore live data. These checks do not operate cameras or confirm a physical page turn.
 
 Keep `.env` files, camera captures, and generated OCR output out of Git.

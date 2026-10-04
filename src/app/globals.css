@@ -1182,6 +1182,27 @@ p,h1,h2,h3 {
 .capture-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .capture-status { font-size: 10px; color: #8c493b; }
 .capture-status.status-reading { color: var(--green); }
+.auto-scan-status { margin: 0 0 10px; color: #71674e; font-size: 10px; line-height: 1.45; }
+.command-event.event-auto_scan { color: #496245; }
+.developer-test-controls { margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--rule); }
+.developer-test-controls h3 { font: 500 11px/1.4 var(--font-mono), monospace; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 9px; }
+.developer-test-controls .notebook-button { font-size: 10px; padding: 6px 9px; }
+.developer-test-controls p { margin: 8px 0 0; color: #71674e; font-size: 10px; line-height: 1.45; }
+.camera-blink-status { margin-top: 12px; padding: 9px 10px; background: #b7be8f20; border-left: 2px solid #8a9473; font-size: 11px; line-height: 1.5; }
+.camera-blink-status p { margin: 0; }
+.camera-blink-status p + p { margin-top: 5px; }
+.tracker-mode-control { display: flex; align-items: center; gap: 9px; font-size: 12px; cursor: pointer; }
+.tracker-mode-control input { appearance: none; position: relative; flex: 0 0 32px; width: 32px; height: 19px; margin: 0; border: 1px solid #969983; border-radius: 12px; background: #b8baa5; cursor: pointer; }
+.tracker-mode-control input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 11px; height: 11px; border-radius: 50%; background: #faf5e4; transition: transform 120ms; }
+.tracker-mode-control input:checked { background: #526344; border-color: #526344; }
+.tracker-mode-control input:checked::after { transform: translateX(13px); }
+.tracker-mode-control input:focus-visible { outline: 2px solid #526344; outline-offset: 3px; }
+.tracker-mode-control input:disabled { opacity: .55; cursor: not-allowed; }
+.developer-test-controls > .notebook-button { margin-top: 16px; }
+.scan-recovery-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+.scan-recovery-controls .notebook-button { font-size: 11px; padding: 6px 10px; }
+.control-error, .developer-test-controls .control-error { color: #8b302c; font-size: 11px; line-height: 1.5; }
+.capture-toolbar { flex-wrap: wrap; }
 .capture-toolbar .developer-scan-controls { margin: 0; gap: 8px; font-size: 10px; }
 .capture-toolbar .notebook-button { font-size: 10px; padding: 5px 9px; }
 .scan-preview { margin: 0; }

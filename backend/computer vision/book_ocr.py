@@ -17,8 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 from dotenv import load_dotenv
-from openai import OpenAI
-
+from openai import APITimeoutError, OpenAI
 
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -170,10 +169,14 @@ def frame_quality(frame: np.ndarray) -> tuple[float, float, float]:
     return sharpness * (1.0 - exposure_penalty), sharpness, brightness
 
 
-def capture_best_frames(cap: cv2.VideoCapture, sample_count: int = CAPTURE_SAMPLE_COUNT) -> list[np.ndarray]:
+def capture_best_frames(
+    cap: cv2.VideoCapture, sample_count: int = CAPTURE_SAMPLE_COUNT, *, check_cancel=None,
+) -> list[np.ndarray]:
     """Return sharp, well-exposed frames instead of trusting one final frame."""
     scored_frames: list[tuple[float, np.ndarray]] = []
     for _ in range(sample_count):
+        if check_cancel:
+            check_cancel()
         ok, frame = cap.read()
         if ok:
             quality, _, _ = frame_quality(frame)
@@ -275,7 +278,7 @@ Do not use any text source other than the image.
 """
 
     try:
-        response = OpenAI(api_key=api_key).responses.create(
+        response = OpenAI(api_key=api_key, timeout=45.0, max_retries=0).responses.create(
             model=model,
             store=False,
             input=[
@@ -288,8 +291,11 @@ Do not use any text source other than the image.
                 }
             ],
         )
+    except APITimeoutError:
+        print("OpenAI vision transcription timed out.")
+        return OpenAiReview(False, "", "openai_request_timed_out", model)
     except Exception as error:
-        print(f"OpenAI vision transcription failed: {error}")
+        print(f"OpenAI vision transcription failed ({type(error).__name__}).")
         return OpenAiReview(False, "", "openai_request_failed", model)
     return parse_openai_review(response.output_text, model)
 
@@ -318,7 +324,7 @@ FIRST VISION TRANSCRIPTION:
 """ + first_transcription
 
     try:
-        response = OpenAI(api_key=api_key).responses.create(
+        response = OpenAI(api_key=api_key, timeout=45.0, max_retries=0).responses.create(
             model=model,
             store=False,
             input=[
@@ -331,8 +337,11 @@ FIRST VISION TRANSCRIPTION:
                 }
             ],
         )
+    except APITimeoutError:
+        print("OpenAI OCR revision timed out.")
+        return OpenAiReview(False, "", "openai_revision_timed_out", model)
     except Exception as error:
-        print(f"OpenAI OCR revision failed: {error}")
+        print(f"OpenAI OCR revision failed ({type(error).__name__}).")
         return OpenAiReview(False, "", "openai_revision_request_failed", model)
     return parse_openai_review(response.output_text, model)
 

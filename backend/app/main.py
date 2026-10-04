@@ -1,9 +1,10 @@
 import json
+from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from openai import AsyncOpenAI
@@ -12,8 +13,8 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.router import api_router
 from app.core.config import settings as core_settings
-from app.services.book_scanner import scan_camera
-from app.services.eye_telemetry import read_eye_snapshot
+from app.services import tracker_settings as tracker_settings_service
+from app.services.eye_telemetry import MAX_SNAPSHOT_BYTES, parse_snapshot_envelope
 from app.services.narration import (
     combine_cues,
     fallback_cues,
@@ -22,14 +23,30 @@ from app.services.narration import (
     parse_moods,
     split_sentences,
 )
+from app.services.scan_jobs import MIN_PAGE_SETTLE_SECONDS, ScanBusyError, ScanJobCoordinator
+from app.services.tracker_settings import router as tracker_settings_router
 
 from .config import settings
+
+scan_job_coordinator = ScanJobCoordinator(
+    openai_api_key=settings.openai_api_key,
+    openai_model=settings.openai_ocr_model,
+    openai_revision_model=settings.openai_ocr_review_model,
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    await run_in_threadpool(scan_job_coordinator.shutdown)
+
 
 app = FastAPI(
     title="LOOB Reading Companion API",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -39,6 +56,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router, prefix=core_settings.api_prefix)
+app.include_router(tracker_settings_router)
 
 
 class Question(BaseModel):
@@ -56,8 +74,45 @@ class NarrationPlanRequest(BaseModel):
 
 
 class CameraScanRequest(BaseModel):
-    camera_index: int = Field(default=1, ge=0, le=10)
+    camera_index: int = Field(default=2, ge=0, le=10)
     show_preview: bool = True
+
+
+class AutoScanRequest(BaseModel):
+    """A deliberate page turn from camera one starts a camera-two OCR job."""
+
+    trigger_id: str = Field(min_length=1, max_length=100)
+    eye_camera_index: int = Field(ge=0, le=10)
+    camera_index: int = Field(ge=0, le=10)
+    settle_seconds: float = Field(default=MIN_PAGE_SETTLE_SECONDS, ge=0, le=30)
+
+
+class ScanJobRequest(BaseModel):
+    source: Literal["manual", "test", "automatic"] = "manual"
+    camera_index: int = Field(default=2, ge=0, le=10)
+    eye_camera_index: int | None = Field(default=None, ge=0, le=10)
+    trigger_id: str | None = Field(default=None, min_length=1, max_length=100)
+    settle_seconds: float = Field(default=0, ge=0, le=30)
+
+
+class PageTurnReservationRequest(BaseModel):
+    trigger_id: str = Field(min_length=1, max_length=100)
+    eye_camera_index: int = Field(ge=0, le=10)
+    camera_index: int | None = Field(default=None, ge=0, le=10)
+    settle_seconds: float = Field(default=MIN_PAGE_SETTLE_SECONDS, ge=0, le=30)
+
+
+def scan_operation(operation, *args, **kwargs) -> dict[str, object]:
+    try:
+        return operation(*args, **kwargs)
+    except KeyError as error:
+        raise HTTPException(404, "Scan job not found; the API may have restarted.") from error
+    except ScanBusyError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(503, str(error)) from error
 
 
 def require_openai_key() -> None:
@@ -77,25 +132,89 @@ async def health() -> dict[str, bool]:
 
 @app.get("/v1/diagnostics/eyes")
 def eye_diagnostics(response: Response) -> dict[str, object]:
-    """Read derived measurements from the separately running local eye tracker."""
+    """Read the active tracker session's in-memory derived measurements."""
     response.headers["Cache-Control"] = "no-store"
-    return read_eye_snapshot()
+    return tracker_settings_service.tracker_settings.diagnostics()
 
 
-@app.post("/v1/scan-camera")
-async def scan_book_page(request: CameraScanRequest) -> dict[str, object]:
-    """Scan a physical book page and return it only after the OCR quality gate passes."""
+@app.post("/v1/diagnostics/eyes")
+async def publish_eye_diagnostics(request: Request, response: Response) -> dict[str, object]:
+    """Bound bytes while streaming, before parsing JSON or accepting ownership."""
+    contents = bytearray()
+    async for chunk in request.stream():
+        if len(contents) + len(chunk) > MAX_SNAPSHOT_BYTES:
+            raise HTTPException(413, "Eye diagnostics must be at most 32768 bytes.")
+        contents.extend(chunk)
     try:
-        return await run_in_threadpool(
-            scan_camera,
-            request.camera_index,
-            openai_api_key=settings.openai_api_key,
-            openai_model=settings.openai_ocr_model,
-            openai_revision_model=settings.openai_ocr_review_model,
-            show_preview=request.show_preview,
-        )
-    except RuntimeError as error:
-        raise HTTPException(503, str(error)) from error
+        envelope = parse_snapshot_envelope(contents)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise HTTPException(422, "Invalid eye diagnostics: " + str(error)[:160]) from error
+    try:
+        result = tracker_settings_service.tracker_settings.publish_diagnostics(**envelope)
+    except PermissionError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@app.post("/v1/scan-camera", status_code=202)
+def scan_book_page(request: CameraScanRequest) -> dict[str, object]:
+    """Legacy route: now returns a cancellable job rather than a blocking capture."""
+    return scan_operation(
+        scan_job_coordinator.start_scan, camera_index=request.camera_index,
+        source="manual" if request.show_preview else "test",
+    )
+
+
+@app.post("/v1/auto-scans", status_code=202)
+def start_automatic_scan(request: AutoScanRequest) -> dict[str, object]:
+    """Legacy route shares the same camera lock as every other scan."""
+    return scan_operation(
+        scan_job_coordinator.start_scan, source="automatic", **request.model_dump(),
+    )
+
+
+@app.get("/v1/auto-scans/latest")
+@app.get("/v1/scan-jobs/latest")
+def latest_automatic_scan(response: Response, include_result: bool = False) -> dict[str, object]:
+    """Return compact progress while polling; request the OCR text only once complete."""
+    response.headers["Cache-Control"] = "no-store"
+    return scan_job_coordinator.latest(include_result=include_result)
+
+
+@app.post("/v1/scan-jobs", status_code=202)
+def start_scan_job(request: ScanJobRequest) -> dict[str, object]:
+    """Start immediately when idle; discard busy requests with 409 and no replay."""
+    return scan_operation(scan_job_coordinator.start_scan, **request.model_dump())
+
+
+@app.get("/v1/scan-jobs/{job_id}")
+def read_scan_job(job_id: str, response: Response,
+                  include_result: bool = False) -> dict[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    return scan_operation(scan_job_coordinator.get, job_id, include_result=include_result)
+
+
+@app.post("/v1/scan-jobs/{job_id}/capture", status_code=202)
+def capture_scan_job(job_id: str) -> dict[str, object]:
+    return scan_operation(scan_job_coordinator.capture, job_id)
+
+
+@app.post("/v1/scan-jobs/{job_id}/cancel", status_code=202)
+def cancel_scan_job(job_id: str) -> dict[str, object]:
+    return scan_operation(scan_job_coordinator.cancel, job_id)
+
+
+@app.post("/v1/page-turns/reserve", status_code=202)
+def reserve_page_turn(request: PageTurnReservationRequest) -> dict[str, object]:
+    return scan_operation(scan_job_coordinator.reserve, **request.model_dump())
+
+
+@app.post("/v1/page-turns/{job_id}/commit", status_code=202)
+def commit_page_turn(job_id: str) -> dict[str, object]:
+    return scan_operation(scan_job_coordinator.commit, job_id)
 
 
 @app.post("/v1/ask")

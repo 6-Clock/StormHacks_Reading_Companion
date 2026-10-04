@@ -20,6 +20,9 @@ export type EyeDiagnostics = {
   openness: { left: number; right: number } | null;
   phase: string | null;
   blink_count: number;
+  calibrated: boolean | null;
+  turns_blocked: boolean | null;
+  blink_only: boolean | null;
   look_progress: number;
   capture_fps: number | null;
   inference_fps: number | null;
@@ -42,6 +45,7 @@ export function useEyeDiagnostics(active: boolean): EyeDiagnosticsState {
 
     let stopped = false;
     let nextPoll: ReturnType<typeof setTimeout> | undefined;
+    let freshnessTimer: ReturnType<typeof setTimeout> | undefined;
     let request: AbortController | undefined;
     let resumeImmediately = false;
 
@@ -61,10 +65,24 @@ export function useEyeDiagnostics(active: boolean): EyeDiagnosticsState {
         if (typeof data.connected !== "boolean" || !Array.isArray(data.events)) {
           throw new Error("Invalid diagnostics");
         }
-        retryDelay = data.connected ? 500 : 5_000;
-        if (!stopped && !document.hidden) setState({ data, status: "connected" });
+        const age = typeof data.updated_at === "number" ? Date.now() - data.updated_at * 1_000 : Infinity;
+        if (age < -1_000 || age >= 2_000) data.connected = false;
+        retryDelay = data.connected ? 500 : 2_000;
+        if (!stopped && !document.hidden) {
+          clearTimeout(freshnessTimer);
+          setState({ data, status: "connected" });
+          if (data.connected) {
+            // A stalled request must not leave the last eye measurements looking live.
+            freshnessTimer = setTimeout(() => setState((current) => current.data?.updated_at === data.updated_at
+              ? { ...current, data: { ...current.data, connected: false } }
+              : current), Math.max(0, 2_000 - Math.max(0, age)));
+          }
+        }
       } catch {
-        if (!stopped && !document.hidden) setState({ data: null, status: "disconnected" });
+        if (!stopped && !document.hidden) {
+          clearTimeout(freshnessTimer);
+          setState({ data: null, status: "disconnected" });
+        }
       } finally {
         clearTimeout(timeout);
         request = undefined;
@@ -78,6 +96,7 @@ export function useEyeDiagnostics(active: boolean): EyeDiagnosticsState {
 
     function onVisibilityChange() {
       clearTimeout(nextPoll);
+      clearTimeout(freshnessTimer);
       if (document.hidden) {
         resumeImmediately = false;
         request?.abort();
@@ -94,6 +113,7 @@ export function useEyeDiagnostics(active: boolean): EyeDiagnosticsState {
     return () => {
       stopped = true;
       clearTimeout(nextPoll);
+      clearTimeout(freshnessTimer);
       request?.abort();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };

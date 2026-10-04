@@ -2,11 +2,13 @@
 
 import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Image from "next/image";
-import { ask, LoobError, makeSpeech, planNarration, scanCamera, transcribe, type CameraScan, type NarrationMood, type NarrationPlan, type StoryEffect } from "@/lib/api";
+import { ask, LoobError, makeSpeech, planNarration, transcribe, type CameraScan, type NarrationMood, type NarrationPlan, type StoryEffect } from "@/lib/api";
 import { AmbientSound } from "@/lib/ambient";
 import { DeskIcon } from "@/components/DeskIcon";
 import { DeveloperPanel } from "@/components/DeveloperPanel";
 import { useEyeDiagnostics } from "@/lib/diagnostics";
+import { useScanJobs } from "@/lib/scan-jobs";
+import { useTrackerSettings } from "@/lib/tracker-settings";
 import { countAskedWords, findAskedTerm } from "@/lib/reading-journal";
 import notebook from "@/assets/blank note.png";
 import bookmark from "@/assets/bookmark_with_no_wrinkle.png";
@@ -22,7 +24,7 @@ const initialPassage = [
   "A small black cat padded into the moonlight and brushed against her ankle. Mara let out a laugh. The warm glow of a night-light filled the attic, and the house felt safe again.",
 ];
 
-const timestamp = () => Date.now();
+const wait = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 const sessionDateLabel = () => new Intl.DateTimeFormat("en", { weekday: "short", month: "short", day: "numeric" }).format(new Date());
 const serverDateLabel = () => "Your reading journal";
 function subscribeDate(onChange: () => void) {
@@ -84,6 +86,19 @@ export function ReadingDesk() {
   const [wordNote, setWordNote] = useState<{ term: string; answer: string } | null>(null);
   const sessionDate = useSyncExternalStore(subscribeDate, sessionDateLabel, serverDateLabel);
   const diagnostics = useEyeDiagnostics(true);
+  const tracker = useTrackerSettings();
+  const scans = useScanJobs((job) => {
+    if (job.result && (job.status === "accepted" || job.status === "rejected" || (job.status === "unchanged" && !pageScanned))) {
+      if (job.result.accepted) stopAudio();
+      applyScanResult(job.result, {
+        capturedAt: (job.completed_at ?? Date.now() / 1_000) * 1_000,
+        durationMs: job.duration_ms ?? 0,
+        automatic: job.source !== "manual",
+      });
+    } else if (["failed", "timed_out", "cancelled", "unchanged"].includes(job.status)) {
+      add({ role: job.status === "failed" || job.status === "timed_out" ? "error" : "notice", text: job.message });
+    }
+  });
   const [messages, setMessages] = useState<Message[]>([]);
   const [toolStatus, setToolStatus] = useState<{ text: string; error: boolean } | null>(null);
   const [input, setInput] = useState("");
@@ -94,8 +109,9 @@ export function ReadingDesk() {
   const [pageText, setPageText] = useState(() => initialPassage.join("\n\n"));
   const [pageTitle, setPageTitle] = useState("The Whisper in the Attic");
   const [pageScanned, setPageScanned] = useState(false);
-  const [cameraIndex, setCameraIndex] = useState(1);
-  const [scanning, setScanning] = useState(false);
+  const [cameraIndex, setCameraIndex] = useState(2);
+  const scanning = scans.active || scans.action !== null;
+  const [blinkTestCount, setBlinkTestCount] = useState<number | null>(null);
   const [immersive, setImmersive] = useState(false);
   const [ambientVolume, setAmbientVolume] = useState(60);
   const [activeParagraph, setActiveParagraph] = useState<number | null>(null);
@@ -113,6 +129,7 @@ export function ReadingDesk() {
   const speechCache = useRef(new Map<string, Blob>());
   const journalEnd = useRef<HTMLDivElement | null>(null);
   const questionInput = useRef<HTMLInputElement | null>(null);
+  const scanControlWorking = useRef(false);
 
   function logEvent(type: string, message: string) {
     setEvents((current) => [...current, { id: crypto.randomUUID(), time: Date.now() / 1000, type, message }].slice(-60));
@@ -332,41 +349,101 @@ export function ReadingDesk() {
     }
   }
 
+  function applyScanResult(result: CameraScan, details: { capturedAt: number; durationMs: number; automatic: boolean }) {
+    if (result.capture_preview || !/scan_cancelled|no_camera_frames/.test(result.reason)) {
+      setLastScan({ result, capturedAt: details.capturedAt, durationMs: details.durationMs });
+    }
+    logEvent(
+      result.accepted ? "success" : "error",
+      result.accepted
+        ? `${details.automatic ? "Automatic " : ""}OCR accepted · ${result.text.trim().split(/\s+/).length} words`
+        : `OCR rejected · ${result.reason}`,
+    );
+    if (!result.accepted) {
+      add({ role: "error", text: scanError(result.reason) });
+      return;
+    }
+    setPageText(result.text);
+    planCache.current = null;
+    speechCache.current.clear();
+    setPageMoods(null);
+    setAskedTerms([]);
+    setWordNote(null);
+    setPageTitle("Scanned book page");
+    setPageScanned(true);
+    const reviewNote = result.openai_revision_status === "requested"
+      ? " with AI transcription and revision"
+      : result.openai_review_status === "requested" ? " with AI vision review" : "";
+    add({
+      role: "notice",
+      text: details.automatic
+        ? `New page scanned automatically${reviewNote}. You can now ask LOOB about it.`
+        : `Page scanned${reviewNote}. You can now ask LOOB about it.`,
+    });
+  }
   async function scanPage() {
-    if (scanning || busy || recording || micWorking.current) return;
+    if (scanControlWorking.current || scanning || blinkTestCount !== null || busy || recording || micWorking.current) return;
+    scanControlWorking.current = true;
     setToolStatus(null);
     stopAudio();
-    setScanning(true);
-    const startedAt = timestamp();
-    logEvent("scan", `Camera ${cameraIndex} · calibration opened`);
     try {
-      const result = await scanCamera(cameraIndex);
-      const capturedAt = timestamp();
-      if (result.capture_preview || !/scan_cancelled|no_camera_frames/.test(result.reason)) {
-        setLastScan({ result, capturedAt, durationMs: capturedAt - startedAt });
-      }
-      logEvent(result.accepted ? "success" : "error", result.accepted ? `OCR accepted · ${result.text.trim().split(/\s+/).length} words` : `OCR rejected · ${result.reason}`);
-      if (!result.accepted) {
-        add({ role: "error", text: scanError(result.reason) });
+      const eyeCamera = tracker.data?.tracker_connected ? tracker.data.eye_camera_index ?? undefined
+        : diagnostics.data?.connected ? diagnostics.data.camera_index ?? undefined : undefined;
+      const started = await scans.start(cameraIndex, "manual", eyeCamera);
+      if (!started) {
+        const message = "Scan skipped: OCR is still running. Start a new scan after it finishes.";
+        logEvent("scan", message);
+        setToolStatus({ text: message, error: false });
         return;
       }
-      setPageText(result.text);
-      planCache.current = null;
-      speechCache.current.clear();
-      setPageMoods(null);
-      setAskedTerms([]);
-      setWordNote(null);
-      setPageTitle("Scanned book page");
-      setPageScanned(true);
-      const reviewNote = result.openai_revision_status === "requested"
-        ? " with AI transcription and revision"
-        : result.openai_review_status === "requested" ? " with AI vision review" : "";
-      add({ role: "notice", text: `Page scanned${reviewNote}. You can now ask LOOB about it.` });
+      logEvent("scan", `Manual OCR requested for camera ${cameraIndex}`);
     } catch (error) {
       logEvent("error", error instanceof LoobError ? error.message : "Camera scan failed");
       add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not scan the camera page." });
     } finally {
-      setScanning(false);
+      scanControlWorking.current = false;
+    }
+  }
+
+  async function testThreeBlinks() {
+    if (scanControlWorking.current || scanning || blinkTestCount !== null || busy || recording) return;
+    const eyeCameraIndex = tracker.data?.eye_camera_index ?? diagnostics.data?.camera_index ?? 1;
+    if (eyeCameraIndex === cameraIndex) {
+      add({ role: "error", text: "Choose different camera indexes for eye tracking and OCR first." });
+      return;
+    }
+    scanControlWorking.current = true;
+    setToolStatus(null);
+    stopAudio();
+    setBlinkTestCount(0);
+    try {
+      for (const count of [1, 2, 3]) {
+        await wait(220);
+        setBlinkTestCount(count);
+        logEvent("blink", `Developer test blink ${count}/3`);
+      }
+      const started = await scans.start(cameraIndex, "test", eyeCameraIndex);
+      if (!started) {
+        const message = "Blink test scan skipped: OCR is still running. Try again after it finishes.";
+        logEvent("auto_scan", message);
+        setToolStatus({ text: message, error: false });
+        return;
+      }
+      logEvent("auto_scan", `Simulated 3 blinks; camera ${cameraIndex} OCR requested`);
+    } catch (error) {
+      add({ role: "error", text: error instanceof LoobError ? error.message : "LOOB could not start the blink test scan." });
+    } finally {
+      setBlinkTestCount(null);
+      scanControlWorking.current = false;
+    }
+  }
+
+  async function controlScan(action: "capture" | "cancel") {
+    try {
+      if (action === "capture") await scans.capture();
+      else await scans.cancel();
+    } catch (error) {
+      add({ role: "error", text: error instanceof Error ? error.message : "Scan control failed. Try again." });
     }
   }
 
@@ -455,7 +532,7 @@ export function ReadingDesk() {
         <div id="reader-panel" className="notebook-spread" role="region" aria-label="Reader" hidden={tab !== "reader"}>
           <section className="notebook-page left-page journal-page" aria-label="Reading journal">
             <header className="page-heading"><span className="folio-heading">01</span><div><h1>{pageTitle}</h1><p className="page-subtitle">{sessionDate} · reading log</p></div></header>
-            <div className="reader-mode"><span>Mode: <strong>{liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
+            <div className="reader-mode"><span>Mode: <strong>{tracker.applied && tracker.data?.applied_blink_only ? scanning ? "Blink test · scan in progress" : "Blink test · ready" : liveEyes?.mode === "SIGNAL" ? "Page signal" : liveEyes?.mode === "STOP" ? "Paused · gaze to restart" : "Reading"}</strong></span>{liveEyes && <span className="mode-note">Eyes open: {eyeOpenness === null ? "—" : `${eyeOpenness}%`}</span>}</div>
             <div className="journal-toolbar">
               <h2 className="journal-heading">Voice log</h2>
               <button className={`icon-button reader-mic${recording ? " recording" : ""}`} type="button" disabled={!recording && (controlsBusy || scanning)} onClick={() => void toggleMic()} aria-label={recording ? "Stop recording" : "Start recording"} aria-pressed={recording} title={recording ? "Stop recording" : "Ask with your voice"}><DeskIcon name={recording ? "stop" : "mic"} width="19" height="19" /></button>
@@ -495,7 +572,7 @@ export function ReadingDesk() {
         </div>
 
         <div id="developer-panel" className="notebook-spread" role="region" aria-label="Developer" hidden={tab !== "developer"}>
-          <DeveloperPanel diagnostics={diagnostics} lastScan={lastScan} scanning={scanning} scanDisabled={controlsBusy || recording} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} pageText={pageText} events={events}>
+          <DeveloperPanel diagnostics={diagnostics} tracker={tracker} lastScan={lastScan} scanJob={scans.job} scanConnected={scans.connected} scanError={scans.error} scanAction={scans.action} scanDisabled={controlsBusy || recording || scanning || !scans.connected || blinkTestCount !== null} blinkTestCount={blinkTestCount} cameraIndex={cameraIndex} onCameraIndexChange={setCameraIndex} onScan={() => void scanPage()} onCapture={() => void controlScan("capture")} onCancel={() => void controlScan("cancel")} onTestThreeBlinks={() => void testThreeBlinks()} events={events}>
             <section className="reader-tools" aria-labelledby="reader-tools-heading">
               <h3 id="reader-tools-heading">Reader controls</h3>
               <div className="narration-actions">
@@ -512,7 +589,6 @@ export function ReadingDesk() {
                 <input ref={questionInput} value={input} onChange={(event) => setInput(event.target.value)} placeholder={recording ? "Recording…" : "Ask about this page"} aria-label="Question about the page" disabled={recording || controlsBusy || scanning} maxLength={2000} />
                 <button className="icon-button" aria-label="Send question" disabled={controlsBusy || recording || scanning || !input.trim()}><DeskIcon name="send" width="19" height="19" /></button>
               </form>
-              {scanning && <p className="tool-status" role="status">Camera window: C captures · Q cancels</p>}
               {controlsBusy && <p className="tool-status" role="status">{micPending ? "Transcribing…" : "Answering…"}</p>}
               {toolStatus && <p className={`tool-status${toolStatus.error ? " is-error" : ""}`} role={toolStatus.error ? "alert" : "status"}>{toolStatus.text}</p>}
             </section>

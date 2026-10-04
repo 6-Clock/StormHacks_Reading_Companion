@@ -1,7 +1,8 @@
 "use client";
 
-import type { ReactNode } from "react";
-import type { CameraScan } from "@/lib/api";
+import { useEffect, useState, type ReactNode } from "react";
+import { scanIsActive, type CameraScan, type ScanJob, type ScanStatus } from "@/lib/api";
+import type { TrackerSettingsControl } from "@/lib/tracker-settings";
 import type { DiagnosticEvent, EyeDiagnosticsState } from "@/lib/diagnostics";
 import { ScanPreview } from "@/components/ScanPreview";
 
@@ -9,13 +10,20 @@ export type ScanSnapshot = { result: CameraScan; capturedAt: number; durationMs:
 
 type DeveloperPanelProps = {
   diagnostics: EyeDiagnosticsState;
+  tracker: TrackerSettingsControl;
   lastScan: ScanSnapshot | null;
-  scanning: boolean;
+  scanJob: ScanJob | null;
+  scanConnected: boolean;
+  scanError: string | null;
+  scanAction: "starting" | "capture" | "cancel" | null;
   scanDisabled?: boolean;
+  blinkTestCount: number | null;
   cameraIndex: number;
   onCameraIndexChange: (index: number) => void;
   onScan: () => void;
-  pageText: string;
+  onCapture: () => void;
+  onCancel: () => void;
+  onTestThreeBlinks: () => void;
   events: DiagnosticEvent[];
   children?: ReactNode;
 };
@@ -37,18 +45,57 @@ function directionLabel(gaze: { x: number; y: number } | null) {
   return [vertical, horizontal].filter(Boolean).join(" ") || "center";
 }
 
-export function DeveloperPanel({ diagnostics, lastScan, scanning, scanDisabled = false, cameraIndex, onCameraIndexChange, onScan, events, children }: DeveloperPanelProps) {
+const scanLabels: Record<ScanStatus, string> = {
+  idle: "Ready to scan", reserved: "Page turn reserved", queued: "Starting scan",
+  settling: "Waiting for page to settle", opening_camera: "Opening camera",
+  framing: "Frame the page", capturing: "Capturing page", transcribing: "Reading text",
+  reviewing: "Checking text", preview: "Preparing preview", cancelling: "Cancelling scan…",
+  accepted: "Page accepted", rejected: "Page not clear enough", unchanged: "Same page",
+  cancelled: "Scan cancelled", failed: "Scan failed", timed_out: "Scan timed out",
+};
+
+function PageTurnCountdown({ startsAt, duration }: { startsAt: number; duration: number }) {
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 100);
+    return () => clearInterval(timer);
+  }, []);
+  const remaining = Math.max(0, Math.ceil(now === null ? duration : startsAt - now / 1_000));
+  return <p className="auto-scan-status" role="timer" aria-label="Page-turn wait">
+    {remaining > 0 ? `OCR starts in ${remaining}s · waiting for the page to turn.` : "Page-turn wait complete · preparing OCR…"}
+  </p>;
+}
+
+export function DeveloperPanel({ diagnostics, tracker, lastScan, scanJob, scanConnected, scanError, scanAction, scanDisabled = false, blinkTestCount, cameraIndex, onCameraIndexChange, onScan, onCapture, onCancel, onTestThreeBlinks, events, children }: DeveloperPanelProps) {
   const data = diagnostics.data;
   const connected = diagnostics.status === "connected" && data?.connected === true;
   const gaze = connected && data.eyes_visible ? data.gaze : null;
   const openness = connected && data.eyes_visible ? data.openness : null;
   const meanOpenness = openness ? (clamp(openness.left) + clamp(openness.right)) / 2 : null;
-  const sortedEvents = [...events, ...(data?.events ?? [])]
+  const sortedEvents = [...events, ...(data?.events ?? []), ...(scanJob?.events ?? [])]
     .filter((event, index, all) => all.findIndex((item) => item.id === event.id) === index)
     .sort((a, b) => b.time - a.time)
     .slice(0, 20);
   const confidence = lastScan?.result.metrics.vision_confidence;
   const scanWordCount = lastScan?.result.text.trim() ? lastScan.result.text.trim().split(/\s+/).length : 0;
+  const scanning = scanIsActive(scanJob);
+  const blinkOnly = tracker.applied && tracker.data?.applied_blink_only === true;
+  const trackerStatus = !tracker.connected ? "Settings service offline"
+    : !tracker.data?.tracker_connected ? "Tracker offline · setting waits for connection"
+      : tracker.saving || !tracker.applied ? "Applying to eye tracker…"
+        : blinkOnly ? scanning ? "Blinks paused while scanning" : "Blink-only active · stare disabled"
+          : "3-second gaze required to enter Read mode";
+  const captureStatus = !scanConnected ? "Scan service offline" : scanAction === "starting" ? "Starting scan…" : scanLabels[scanJob?.status ?? "idle"];
+  const recoveryDisabled = !scanConnected || scanAction !== null || scanJob?.status === "cancelling";
+  const blinkReadiness = !connected ? "Waiting for live eye measurements."
+    : data.calibrated === false ? "Press C in the eye camera window and keep your eyes open to calibrate."
+      : !data.eyes_visible ? "Move into the eye camera view so both eyes are visible."
+        : data.calibrated !== true ? "Restart the eye tracker to enable live blink readiness."
+          : data.turns_blocked || scanning || data.mode === "SIGNAL" ? "Page turns paused while the scanner or tracker controls are busy."
+            : !data.blink_only && data.mode !== "READ" ? "Hold your gaze for 3 seconds, or enable Blink-only test mode."
+              : "Ready — blink three times within two seconds.";
+  const lastCameraGesture = data?.events.filter((event) => event.type === "blink" && /^Blink 3\/3 recorded/.test(event.message))
+    .sort((a, b) => b.time - a.time)[0];
 
   return <>
     <section className="notebook-page developer-page left-page" aria-labelledby="eye-camera-heading">
@@ -76,10 +123,28 @@ export function DeveloperPanel({ diagnostics, lastScan, scanning, scanDisabled =
         </div>
         <dl className="diagnostic-metrics eye-metrics">
           <div><dt>Eyes open</dt><dd>{meanOpenness === null ? "—" : `${Math.round(meanOpenness * 100)}%`}</dd></div>
-          <div><dt>Blinks</dt><dd>{connected ? data.blink_count : "—"}</dd></div>
+          <div><dt>Blinks</dt><dd>{connected ? `${data.blink_count} / 3` : "—"}</dd></div>
           <div><dt>Gaze</dt><dd>{directionLabel(gaze)}</dd></div>
-          <div><dt>Stare timer</dt><dd>{connected ? `${data.look_progress.toFixed(1)} / 3s` : "—"}</dd></div>
+          <div><dt>Stare timer</dt><dd>{blinkOnly ? "Off · test mode" : connected ? `${data.look_progress.toFixed(1)} / 3s` : "—"}</dd></div>
         </dl>
+        <div className="camera-blink-status" role="status" aria-label="Camera blink detection">
+          <p>{blinkReadiness}</p>
+          {lastCameraGesture && <p className="status-reading">Camera recorded 3 / 3 at {clockLabel(lastCameraGesture.time)}.</p>}
+        </div>
+        <section className="developer-test-controls" aria-labelledby="developer-test-heading">
+          <h3 id="developer-test-heading">Developer test</h3>
+          <label className="tracker-mode-control">
+            <input type="checkbox" role="switch" checked={tracker.data?.blink_only ?? false} disabled={tracker.saving || !tracker.connected} onChange={(event) => void tracker.toggle(event.target.checked)} aria-describedby="tracker-setting-status" />
+            <span>Blink-only test mode</span>
+          </label>
+          <p id="tracker-setting-status" role="status">{trackerStatus}</p>
+          <p>When enabled, three blinks within two seconds can turn the page without entering Read mode. Page turns pause during scanning.</p>
+          {tracker.error && <p className="control-error" role="alert">{tracker.error}</p>}
+          <button type="button" className="notebook-button" onClick={onTestThreeBlinks} disabled={scanDisabled || blinkTestCount !== null}>
+            {blinkTestCount === null ? "Test 3 blinks" : `Blink ${blinkTestCount} / 3`}
+          </button>
+          <p>Simulates three blinks and starts camera {cameraIndex} OCR. This button does not move the page-turn hardware.</p>
+        </section>
       </div>
       <footer className="page-footer"><span>A1 · Appendix</span><span className={`connection-label${connected ? " is-connected" : ""}`}>{connected ? "tracker live" : "tracker offline"}</span></footer>
     </section>
@@ -91,12 +156,22 @@ export function DeveloperPanel({ diagnostics, lastScan, scanning, scanDisabled =
       </header>
       <div className="developer-body">
         <div className="capture-toolbar">
-          <span className={`capture-status${lastScan?.result.accepted ? " status-reading" : ""}`} role="status">{scanning ? "scanning…" : lastScan ? lastScan.result.accepted ? "accepted" : "not accepted" : "—"}</span>
+          <span className={`capture-status${scanJob?.status === "accepted" ? " status-reading" : ""}`} role="status">{captureStatus}</span>
           <div className="developer-scan-controls">
             <label htmlFor="developer-camera-index">Cam <input id="developer-camera-index" aria-label="Book camera index" type="number" min="0" max="10" step="1" value={cameraIndex} disabled={scanning || scanDisabled} onChange={(event) => { const next = Number(event.target.value); if (Number.isInteger(next) && next >= 0 && next <= 10) onCameraIndexChange(next); }} /></label>
-            <button type="button" className="notebook-button" onClick={onScan} disabled={scanning || scanDisabled}>{scanning ? "Scanning…" : "Scan"}</button>
+            <button type="button" className="notebook-button" onClick={onScan} disabled={scanning || scanDisabled}>{scanning ? "Scanning…" : "Scan OCR"}</button>
           </div>
         </div>
+        {scanJob?.status === "settling" && typeof scanJob.scan_starts_at === "number"
+          ? <PageTurnCountdown key={scanJob.job_id} startsAt={scanJob.scan_starts_at} duration={scanJob.settle_seconds ?? 8} />
+          : scanJob?.job_id && <p className="auto-scan-status" role="status">{scanJob.message}</p>}
+        {scanning && <p className="auto-scan-status">New scan requests are skipped until this scan finishes.</p>}
+        {scanError && <p className="control-error" role="alert">{scanError}</p>}
+        {scanning && <div className="scan-recovery-controls">
+          {scanJob?.status === "framing" && <button type="button" className="notebook-button" onClick={onCapture} disabled={recoveryDisabled}>{scanAction === "capture" ? "Capturing…" : "Capture now"}</button>}
+          <button type="button" className="notebook-button" onClick={onCancel} disabled={recoveryDisabled}>{scanAction === "cancel" || scanJob?.status === "cancelling" ? "Cancelling…" : "Cancel scan"}</button>
+        </div>}
+        {scanJob?.status === "framing" && <p className="auto-scan-status">Position the book in the camera window, then choose Capture now (or press C in that window). Framing times out after 60 seconds.</p>}
         <ScanPreview preview={lastScan?.result.capture_preview ?? null} />
         {lastScan && <details className="ocr-details"><summary>OCR details</summary>
           <dl className="diagnostic-metrics">
@@ -117,7 +192,7 @@ export function DeveloperPanel({ diagnostics, lastScan, scanning, scanDisabled =
           {sortedEvents.length ? <ol className="command-events">{sortedEvents.map((event) => <li key={event.id} className={`command-event event-${event.type.replace(/[^a-zA-Z0-9_-]/g, "")}`}><time dateTime={new Date(event.time * 1_000).toISOString()}>{clockLabel(event.time)}</time><span>{event.message}</span></li>)}</ol> : <p className="empty-log">— no events yet —</p>}
         </section>
       </div>
-      <footer className="page-footer"><span className={`connection-label${diagnostics.status === "connected" ? " is-connected" : ""}`}>API {diagnostics.status === "connected" ? "live" : "offline"}</span><span>Appendix · A2</span></footer>
+      <footer className="page-footer"><span className={`connection-label${scanConnected ? " is-connected" : ""}`}>API {scanConnected ? "live" : "offline"}</span><span>Appendix · A2</span></footer>
     </section>
   </>;
 }

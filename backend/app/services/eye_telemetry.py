@@ -1,30 +1,49 @@
-"""Small local snapshot bridge between the standalone tracker and the API.
+"""Bounded measurement contract shared by the HTTP tracker publisher and API.
 
-Only derived measurements and a bounded event log are written; no camera frames.
-This module deliberately uses only the standard library so the standalone tracker
-does not need to import FastAPI or the provider clients.
+No camera frames or file transport are accepted. Keep this module standard-library
+only so the standalone tracker can reuse the sanitizer without importing FastAPI.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import math
-import os
 import time
-from collections import deque
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
-SNAPSHOT_PATH = Path(__file__).resolve().parents[2] / ".runtime" / "eyes.json"
 STALE_SECONDS = 2.0
+MAX_FUTURE_SECONDS = 0.25
 PUBLISH_INTERVAL = 0.2
 MAX_EVENTS = 32
 MAX_SNAPSHOT_BYTES = 32_768
-EVENT_TYPES = {"tracker", "mode", "blink", "calibration", "command", "reset"}
+EVENT_TYPES = {"tracker", "mode", "blink", "calibration", "command", "auto_scan", "reset"}
 PHASES = {"OPEN", "CLOSING", "CLOSED", "REOPENING", "NO FACE", "CALIBRATING", "NO CALIBRATION"}
-logger = logging.getLogger(__name__)
+SNAPSHOT_FIELDS = {
+    "connected", "updated_at", "camera_index", "mode", "eyes_visible", "gaze", "openness",
+    "phase", "blink_count", "look_progress", "capture_fps", "inference_fps", "frame_age_ms",
+    "events", "calibrated", "turns_blocked", "blink_only",
+}
+
+
+def parse_snapshot_envelope(contents: bytes) -> dict[str, Any]:
+    """Validate publisher identity/envelope before taking the shared ownership lock."""
+    if len(contents) > MAX_SNAPSHOT_BYTES:
+        raise ValueError("Eye diagnostics must be at most 32768 bytes.")
+    value = json.loads(contents)
+    if not isinstance(value, dict) or set(value) != {
+        "tracker_session_id", "sequence", "snapshot",
+    }:
+        raise ValueError("Send tracker_session_id, sequence, and snapshot only.")
+    session = value["tracker_session_id"]
+    sequence = value["sequence"]
+    snapshot = value["snapshot"]
+    if not isinstance(session, str) or not 1 <= len(session) <= 100:
+        raise ValueError("A tracker session ID of 1 to 100 characters is required.")
+    if type(sequence) is not int or not 1 <= sequence <= 2**63 - 1:
+        raise ValueError("Snapshot sequence must be a positive integer.")
+    if not isinstance(snapshot, dict) or set(snapshot) - SNAPSHOT_FIELDS:
+        raise ValueError("Only derived eye measurements and bounded events are accepted.")
+    return value
 
 
 def _number(value: Any, minimum: float = 0, maximum: float = math.inf) -> float | None:
@@ -81,7 +100,7 @@ def sanitize_snapshot(value: Any, *, now: float | None = None) -> dict[str, Any]
     connected = (
         data.get("connected") is True
         and timestamp is not None
-        and -1.0 <= now - timestamp <= STALE_SECONDS
+        and -MAX_FUTURE_SECONDS <= now - timestamp < STALE_SECONDS
     )
     camera_index = _number(data.get("camera_index"), maximum=100)
     camera_index = int(camera_index) if camera_index is not None else None
@@ -105,74 +124,9 @@ def sanitize_snapshot(value: Any, *, now: float | None = None) -> dict[str, Any]
         "capture_fps": _number(data.get("capture_fps")) if connected else None,
         "inference_fps": _number(data.get("inference_fps")) if connected else None,
         "frame_age_ms": _number(data.get("frame_age_ms")) if connected else None,
+        **{
+            field: data[field] if connected and isinstance(data.get(field), bool) else None
+            for field in ("calibrated", "turns_blocked", "blink_only")
+        },
         "events": _events(data.get("events")),
     }
-
-
-def read_eye_snapshot(path: Path | None = None) -> dict[str, Any]:
-    """Missing, unreadable, oversized or partially written files mean disconnected."""
-    try:
-        with (path or SNAPSHOT_PATH).open("rb") as snapshot_file:
-            contents = snapshot_file.read(MAX_SNAPSHOT_BYTES + 1)
-        if len(contents) > MAX_SNAPSHOT_BYTES:
-            return sanitize_snapshot(None)
-        return sanitize_snapshot(json.loads(contents))
-    except (OSError, ValueError, UnicodeError, RecursionError):
-        return sanitize_snapshot(None)
-
-
-class EyeTelemetryPublisher:
-    """Publish at most five snapshots per second without breaking camera operation."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = path or SNAPSHOT_PATH
-        self._session = uuid4().hex
-        self._temporary = self.path.with_name(f".eyes-{self._session}.tmp")
-        self._events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS)
-        self._sequence = 0
-        self._last_write = -math.inf
-        self._last_state: dict[str, Any] = {}
-        self._write_failed = False
-
-    def event(self, event_type: str, message: str) -> None:
-        if event_type not in EVENT_TYPES:
-            raise ValueError(f"Unknown eye telemetry event type: {event_type}")
-        self._sequence += 1
-        self._events.append({
-            "id": f"{self._session}-{self._sequence}",
-            "time": time.time(),
-            "type": event_type,
-            "message": message[:200],
-        })
-
-    def publish(self, measurements: dict[str, Any], *, force: bool = False) -> bool:
-        self._last_state = measurements
-        monotonic_now = time.monotonic()
-        if not force and monotonic_now - self._last_write < PUBLISH_INTERVAL:
-            return False
-        self._last_write = monotonic_now
-        wall_time = time.time()
-        payload = sanitize_snapshot({
-            **measurements,
-            "updated_at": wall_time,
-            "events": list(self._events),
-        }, now=wall_time)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._temporary.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
-            os.replace(self._temporary, self.path)
-            self._write_failed = False
-            return True
-        except OSError:
-            if not self._write_failed:
-                logger.warning("Eye diagnostics could not be saved; camera tracking continues.")
-            self._write_failed = True
-            return False
-
-    def close(self) -> None:
-        self.event("tracker", "Eye tracker stopped")
-        self.publish({**self._last_state, "connected": False}, force=True)
-        try:
-            self._temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
