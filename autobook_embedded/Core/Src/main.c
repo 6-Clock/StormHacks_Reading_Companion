@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +47,9 @@
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
 
+UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
+
 /* Definitions for LibraryHandler */
 osThreadId_t LibraryHandlerHandle;
 const osThreadAttr_t LibraryHandler_attributes = {
@@ -59,6 +63,13 @@ const osThreadAttr_t MainTask_attributes = {
   .name = "MainTask",
   .stack_size = 2048 * 4,
   .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for UartTast */
+osThreadId_t UartTastHandle;
+const osThreadAttr_t UartTast_attributes = {
+  .name = "UartTast",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
 /* Watch these in the debugger while tuning the clamp. Raw counts, not N*m. */
@@ -76,9 +87,12 @@ volatile float clampExampleTargetRPM = 0.0f;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_USART1_UART_Init(void);
 void StartLibraryHandler(void *argument);
 void StartMainTask(void *argument);
+void StartUartTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 static bool WaitForBookClampFeedback(uint32_t timeoutMs);
@@ -121,7 +135,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_CAN1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   if (GM6020_InitBus(1, &hcan1, GM6020_VOLTAGE) != HAL_OK)
   {
@@ -155,6 +171,9 @@ int main(void)
 
   /* creation of MainTask */
   MainTaskHandle = osThreadNew(StartMainTask, NULL, &MainTask_attributes);
+
+  /* creation of UartTast */
+  UartTastHandle = osThreadNew(StartUartTask, NULL, &UartTast_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -263,6 +282,55 @@ static void MX_CAN1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -275,9 +343,10 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
 
   /*Configure GPIO pin : PA0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
@@ -311,10 +380,6 @@ static bool WaitForBookClampFeedback(uint32_t timeoutMs)
   return false;
 }
 
-/* Call once for each intended run, not continuously in the polling loop.
- * Copies the chosen RPM/PID into the library's asynchronous guarded control.
- * LibraryHandler stops on sustained load, timeout, lost feedback or late service.
- * Tune the raw-current threshold/command limit by feel; no N*m calibration. */
 static bool RunBookClamp(float closingRPM)
 {
   const float pid[3] = {55.0f, 0.01f, 0.0f};
@@ -373,6 +438,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
   }
 }
 
+uint16_t motorPos;
 
 /* USER CODE END 4 */
 
@@ -420,6 +486,7 @@ void StartMainTask(void *argument)
   for (;;)
   {
     const uint32_t now = HAL_GetTick();
+    motorPos = get6020Pos(1, 2);
     const bool pressed = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
     if (pressed != buttonSample)
     {
@@ -438,6 +505,35 @@ void StartMainTask(void *argument)
     osDelay(5);
   }
   /* USER CODE END StartMainTask */
+}
+
+/* USER CODE BEGIN Header_StartUartTask */
+/**
+* @brief Function implementing the UartTast thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartUartTask */
+void StartUartTask(void *argument)
+{
+  /* USER CODE BEGIN StartUartTask */
+  char uartBuff[16];
+  /* Infinite loop */
+  for(;;)
+  {
+	int length;
+	if (motorPos == GM6020_INVALID_POSITION)
+		length = snprintf(uartBuff, sizeof(uartBuff), "offline\r\n");
+	else
+		length = snprintf(uartBuff, sizeof(uartBuff),
+						  "%u\r\n", (unsigned)motorPos);
+
+    if (length > 0 && (size_t)length < sizeof(uartBuff)) {
+    	HAL_UART_Transmit(&huart1, (uint8_t *)uartBuff, (uint16_t)length, 10);
+    }
+    osDelay(10);
+  }
+  /* USER CODE END StartUartTask */
 }
 
 /**
