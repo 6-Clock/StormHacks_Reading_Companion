@@ -75,11 +75,25 @@ p,h1,h2,h3 {
   padding: 28px 0 20px;
 }
 
-.wordmark {
-  color: #eeeedd;
-  font-size: 23px;
-  font-weight: 650;
-  letter-spacing: -.8px;
+.app-logo-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: #F4EEDB;
+}
+
+.app-logo-symbol {
+  display: block;
+  width: 31px;
+  height: 31px;
+}
+
+.app-logo-name {
+  font-family: var(--font-sans), Arial, sans-serif;
+  font-size: 28px;
+  font-weight: 720;
+  line-height: 1;
+  letter-spacing: -.95px;
 }
 
 .desk-meta,.desk-footer {
@@ -830,9 +844,8 @@ p,h1,h2,h3 {
 
 @media (max-width:760px) {
 
-  .wordmark {
-    font-size: 19px;
-  }
+  .app-logo-symbol { width: 28px; height: 28px; }
+  .app-logo-name { font-size: 25px; }
 
   .desk-meta {
     width: calc(100% - 24px);

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">LOOB Page Turn logo concept</title>
+  <g id="symbol" fill="#111111">
+    <path d="M36 42H126C164 42 192 70 192 108V122H166V108C166 85 149 68 126 68H62V152H36Z"/>
+    <path d="M220 214H130C92 214 64 186 64 148V134H90V148C90 171 107 188 130 188H194V104H220Z"/>
+    <path d="M128 68C151 68 170 87 170 110V128H144V110C144 101 137 94 128 94Z"/>
+    <path d="M128 188C105 188 86 169 86 146V128H112V146C112 155 119 162 128 162Z"/>
+  </g>
+</svg>

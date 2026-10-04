@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 590 160" width="590" height="160" role="img" aria-labelledby="title">
+  <title id="title">LOOB Reading Companion</title>
+  <g id="symbol" transform="translate(0 16) scale(.5)" fill="#B7C691">
+    <path fill-rule="evenodd" d="M26 52C70 46 103 62 128 93V204C103 173 70 158 26 166ZM230 52C186 46 153 62 128 93V204C153 173 186 158 230 166ZM42 82C75 78 99 90 120 113V140C99 117 75 106 42 110ZM214 82C181 78 157 90 136 113V140C157 117 181 106 214 110Z"/>
+    <circle cx="128" cy="151" r="14"/>
+  </g>
+  <g id="wordmark" fill="#F4EEDB" fill-rule="evenodd">
+    <path d="M172 28H196V108H236V132H172Z"/>
+    <path d="M292 27A53 53 0 1 1 291.9 27ZM292 54A26 26 0 1 0 292.1 54Z"/>
+    <path d="M400 27A53 53 0 1 1 399.9 27ZM400 54A26 26 0 1 0 400.1 54Z"/>
+    <path d="M465 25H500A40 27.5 0 0 1 500 80H465ZM465 80H502A42 27.5 0 0 1 502 135H465ZM489 45H500A19 14 0 0 1 500 73H489ZM489 99H502A20 14 0 0 1 502 127H489Z"/>
+  </g>
+</svg>

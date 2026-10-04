@@ -11,6 +11,7 @@ import { countAskedWords, findAskedTerm } from "@/lib/reading-journal";
 import notebook from "@/assets/blank note.png";
 import bookmark from "@/assets/bookmark_with_no_wrinkle.png";
 import stickyNote from "@/assets/postit yellow png.png";
+import loobSymbol from "@/assets/loob-logo-symbol.svg";
 
 type Message = { id: number; role: "user" | "assistant" | "notice" | "error"; text: string; voice?: boolean };
 type DeskEvent = { id: string; time: number; type: string; message: string };
@@ -435,7 +436,7 @@ export function ReadingDesk() {
 
   return (
     <main className="reading-workspace">
-      <header className="desk-meta"><span className="wordmark">LOOB</span></header>
+      <header className="desk-meta"><div className="app-logo-lockup" aria-label="LOOB"><Image className="app-logo-symbol" src={loobSymbol} alt="" priority /><span className="app-logo-name">LOOB</span></div></header>
       <div className="notebook">
         <div className="notebook-art" aria-hidden="true"><Image src={notebook} alt="" fill sizes="(max-width: 760px) 1600px, 1400px" placeholder="blur" preload /></div>
         <button

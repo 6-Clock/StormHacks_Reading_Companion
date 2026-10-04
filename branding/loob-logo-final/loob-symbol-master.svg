@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">LOOB Reading Window symbol</title>
+  <g id="symbol" fill="#2D2D2D">
+    <path fill-rule="evenodd" d="M26 52C70 46 103 62 128 93V204C103 173 70 158 26 166ZM230 52C186 46 153 62 128 93V204C153 173 186 158 230 166ZM42 82C75 78 99 90 120 113V140C99 117 75 106 42 110ZM214 82C181 78 157 90 136 113V140C157 117 181 106 214 110Z"/>
+    <circle cx="128" cy="151" r="14"/>
+  </g>
+</svg>
