@@ -44,6 +44,13 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BOOK_UART_RUN_COMMAND 50U
+/* Independently tune each automatic transition delay (milliseconds). */
+#define BOOK_STATE_2_TO_3_MS 1000U
+#define BOOK_STATE_3_TO_4_MS 1000U
+#define BOOK_STATE_4_TO_5_MS 1000U
+#define BOOK_STATE_5_TO_6_MS 1000U
+#define BOOK_UART_RX_BUFFER_SIZE 128U
 
 /* USER CODE END PD */
 
@@ -82,6 +89,15 @@ const osThreadAttr_t UartTast_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
+volatile bool bookSequenceActive = false;
+volatile bool bookSequenceStartRejected = false;
+volatile uint32_t bookLastUartCommand = 0;
+static uint32_t bookSequenceStateStartedMs;
+static uint8_t bookUartRxByte;
+static volatile uint8_t bookUartRxBuffer[BOOK_UART_RX_BUFFER_SIZE];
+static volatile uint16_t bookUartRxHead, bookUartRxTail;
+static volatile bool bookUartRxOverflow, bookUartRxNeedsRearm;
+volatile uint32_t bookUartRxErrors = 0;
 volatile BookDeviceState bookDeviceState = BOOK_STATE_1;
 volatile bool bookStateActionAccepted = true;
 /* Watch these in the debugger while tuning the clamp. Raw counts, not N*m. */
@@ -111,6 +127,8 @@ void StartUartTask(void *argument);
 static bool RunBookClamp(float closingRPM);
 static void UpdateBookClampStatus(void);
 static void EnterBookState(BookDeviceState state);
+static bool ReadUartValue(uint32_t *value);
+static void ServiceBookSequence(uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -158,6 +176,9 @@ int main(void)
     Error_Handler();
   }
 
+  /* One-byte interrupt reception stays active while UART TX runs. */
+  if (HAL_UART_Receive_IT(&huart1, &bookUartRxByte, 1) != HAL_OK)
+    Error_Handler();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -508,23 +529,23 @@ static void EnterBookState(BookDeviceState state)
   switch (state)
   {
     case BOOK_STATE_2:
-      pulse1 = 2100, pulse2 = 1600; pulse3 = 1400; pulse4 = 800;
+      pulse1 = 2100, pulse2 = 1600; pulse3 = 1400; pulse4 = 800; // side servos clamp down on book
       break;
     case BOOK_STATE_3:
-      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 800;
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 800; // page gripping servo exposes a page
       break;
     case BOOK_STATE_4:
-      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800;
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800; // wiper servo flips the page
       break;
     case BOOK_STATE_5:
-      pulse1 = 1000, pulse2 = 1600; pulse3 = 2100; pulse4 = 1800;
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 2100; pulse4 = 1800; //the outer page gripping servo opens up
       break;
     case BOOK_STATE_6:
-      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800;
+      pulse1 = 1000, pulse2 = 1600; pulse3 = 1400; pulse4 = 1800; // ... then clamps down on the new page
       break;
     case BOOK_STATE_1:
     default:
-      state = BOOK_STATE_1;
+      state = BOOK_STATE_1; // Initial position, all servos opened up
       pulse1 = 2100, pulse2 = 1200; pulse3 = 1800; pulse4 = 800;
       break;
   }
@@ -547,6 +568,104 @@ static void EnterBookState(BookDeviceState state)
 
   if (state == BOOK_STATE_2)
     bookStateActionAccepted = RunBookClamp(60.0f);
+}
+
+/* Start/service the automatic sequence only from MainTask. */
+static void ServiceBookSequence(uint32_t now)
+{
+  if (!bookSequenceActive) return;
+
+  uint32_t delayMs;
+  switch (bookDeviceState)
+  {
+    case BOOK_STATE_2: delayMs = BOOK_STATE_2_TO_3_MS; break;
+    case BOOK_STATE_3: delayMs = BOOK_STATE_3_TO_4_MS; break;
+    case BOOK_STATE_4: delayMs = BOOK_STATE_4_TO_5_MS; break;
+    case BOOK_STATE_5: delayMs = BOOK_STATE_5_TO_6_MS; break;
+    default: bookSequenceActive = false; return;
+  }
+  if ((uint32_t)(now - bookSequenceStateStartedMs) < delayMs) return;
+
+  /* Timer-only transitions. State 3 stops drive before changing servo outputs. */
+  EnterBookState((BookDeviceState)(bookDeviceState + 1));
+  bookSequenceStateStartedMs = HAL_GetTick();
+  if (bookDeviceState == BOOK_STATE_6) bookSequenceActive = false;
+}
+
+/* UART command input: decimal unsigned values terminated by CR or LF.
+ * Call from exactly one task. No blocking receive or heap allocation.
+ * Invalid/overflowed lines are discarded in full, rather than partly parsed. */
+static bool ReadUartValue(uint32_t *value)
+{
+  static uint32_t parsed;
+  static uint8_t digits;
+  static bool discardLine;
+  if (value == NULL) return false;
+
+  /* Recover interrupt reception after a HAL error without blocking a task. */
+  taskENTER_CRITICAL();
+  if (bookUartRxNeedsRearm &&
+      HAL_UART_Receive_IT(&huart1, &bookUartRxByte, 1) == HAL_OK)
+    bookUartRxNeedsRearm = false;
+  taskEXIT_CRITICAL();
+
+  for (unsigned n = 0; n < BOOK_UART_RX_BUFFER_SIZE; ++n)
+  {
+    uint8_t byte;
+    taskENTER_CRITICAL();
+    if (bookUartRxOverflow)
+    {
+      /* Flush queued fragments. Resume after the next received line ending. */
+      bookUartRxTail = bookUartRxHead;
+      bookUartRxOverflow = false;
+      parsed = 0; digits = 0; discardLine = true;
+    }
+    if (bookUartRxTail == bookUartRxHead)
+    {
+      taskEXIT_CRITICAL();
+      return false;
+    }
+    byte = bookUartRxBuffer[bookUartRxTail];
+    bookUartRxTail = (uint16_t)((bookUartRxTail + 1U) % BOOK_UART_RX_BUFFER_SIZE);
+    taskEXIT_CRITICAL();
+
+    if (byte == '\r' || byte == '\n')
+    {
+      const bool accepted = digits != 0 && !discardLine;
+      const uint32_t result = parsed;
+      parsed = 0; digits = 0; discardLine = false;
+      if (accepted) { *value = result; return true; }
+    }
+    else if (!discardLine)
+    {
+      if (byte < '0' || byte > '9' || digits >= 10U ||
+          parsed > (UINT32_MAX - (uint32_t)(byte - '0')) / 10U)
+        discardLine = true;
+      else { parsed = parsed * 10U + (uint32_t)(byte - '0'); ++digits; }
+    }
+  }
+  return false;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *uart)
+{
+  if (uart != &huart1) return;
+  const uint16_t next = (uint16_t)((bookUartRxHead + 1U) % BOOK_UART_RX_BUFFER_SIZE);
+  if (next == bookUartRxTail) bookUartRxOverflow = true;
+  else
+  {
+    bookUartRxBuffer[bookUartRxHead] = bookUartRxByte;
+    bookUartRxHead = next;
+  }
+  bookUartRxNeedsRearm = HAL_UART_Receive_IT(uart, &bookUartRxByte, 1) != HAL_OK;
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *uart)
+{
+  if (uart != &huart1) return;
+  ++bookUartRxErrors;
+  bookUartRxOverflow = true; /* Drop a command potentially corrupted by error. */
+  bookUartRxNeedsRearm = HAL_UART_Receive_IT(uart, &bookUartRxByte, 1) != HAL_OK;
 }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can)
@@ -612,6 +731,19 @@ void StartMainTask(void *argument)
   {
     const uint32_t now = HAL_GetTick();
     motorPos = get6020Pos(1, 2);
+    uint32_t command;
+    while (ReadUartValue(&command))
+    {
+      bookLastUartCommand = command;
+      if (command == BOOK_UART_RUN_COMMAND && !bookSequenceActive)
+      {
+        EnterBookState(BOOK_STATE_2);
+        bookSequenceStartRejected = !bookStateActionAccepted;
+        bookSequenceActive = bookStateActionAccepted;
+        bookSequenceStateStartedMs = HAL_GetTick();
+      }
+    }
+    ServiceBookSequence(HAL_GetTick());
     const bool pressed = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET;
     if (pressed != buttonSample)
     {
@@ -621,9 +753,9 @@ void StartMainTask(void *argument)
     if (buttonSample != buttonStable && (uint32_t)(now - buttonChangedMs) >= 30U)
     {
       buttonStable = buttonSample;
-      if (buttonStable)
+      if (buttonStable && !bookSequenceActive)
       {
-        /* One transition per press: 1 -> 2 -> 3 -> 1. */
+        /* Manual steps are ignored while the UART sequence runs. */
         const BookDeviceState next = bookDeviceState == BOOK_STATE_6 ?
             BOOK_STATE_2 : (BookDeviceState)(bookDeviceState + 1);
         EnterBookState(next);
